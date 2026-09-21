@@ -213,6 +213,224 @@ small-depth query into uncontrolled work.
 
 # 4. V1 High-Level Architecture
 
+
+### ASCII architecture — interview / quick-view version
+
+The Mermaid diagram below is useful when rendered by GitHub, but this ASCII version is intentionally kept alongside it for easier review and interview discussion.
+
+```text
+                                      QUICKBOOKS UI
+                                           |
+                                           v
+                                  +-------------------+
+                                  |    API Gateway    |
+                                  | AuthN / Rate Limit|
+                                  | Trusted Principal |
+                                  +---------+---------+
+                                            |
+                         +------------------+------------------+
+                         |                                     |
+                       READ                                  WRITE
+                         |                                     |
+                         v                                     v
+              +----------------------+              +----------------------+
+              |    Network Query     |              | Relationship Command |
+              |----------------------|              |----------------------|
+              | View Network         |              | Add Vendor / Client  |
+              | Search Path          |              | Add / Retract Edge   |
+              | Bounded BFS          |              | Idempotency / AuthZ  |
+              +----------+-----------+              +----------+-----------+
+                         |                                     |
+                         |                              identity unknown
+                         |                                     |
+                         |                                     v
+                         |                         +------------------------+
+                         |                         |  Identity Resolution   |
+                         |                         |------------------------|
+                         |                         | Normalize descriptor   |
+                         |                         | Candidate retrieval    |
+                         |                         | Deterministic signals  |
+                         |                         +-----+-------------+----+
+                         |                               |             |
+                         |                    candidates |             | possible
+                         |                               |             | duplicate
+                         |                               v             v
+                         |                    +----------------+  +------------------+
+                         |                    | AI / ML        |  | Duplicate        |
+                         |                    | Candidate      |  | Evaluation       |
+                         |                    | Ranker         |  | existing NB IDs  |
+                         |                    +-------+--------+  +--------+---------+
+                         |                            |                    |
+                         |             +--------------+--------------+     |
+                         |             |              |              |     |
+                         |             v              v              v     |
+                         |           MATCH        NO_MATCH       CONFIRM   |
+                         |             |              |          REQUIRED  |
+                         |             |              |              |     |
+                         |             |              |              v     |
+                         |             |              |        Human Decision
+                         |             |              |         /          \
+                         |             |              |  Use Existing   Create New
+                         |             |              |       |             |
+                         |             v              v       v             v
+                         |        +-------------+   +--------------------------+
+                         |        | Reuse       |   | Create NetworkBusiness   |
+                         |        | Existing NB |   | PENDING_SOURCE           |
+                         |        +------+------+   +-------------+------------+
+                         |               |                        |
+                         |               |                        | create / associate
+                         |               |                        v
+                         |               |              +----------------------+
+                         |               |              | QBO Vendor / Customer|
+                         |               |              | SOURCE OF TRUTH      |
+                         |               |              +----+-------------+---+
+                         |               |                   |             |
+                         |               |                success        failure
+                         |               |                   |             |
+                         |               +---------+---------+             |
+                         |                         |                       |
+                         |                         v                       v
+                         |              +----------------------+   Durable Add Operation
+                         |              | Relationship Command |   SOURCE_PENDING
+                         |              | continues            |          |
+                         |              | canonicalize / AuthZ |          v
+                         |              | create assertion     |   Source Association
+                         |              +----------+-----------+   Retry Worker
+                         |                         |                       |
+                         |                         |                       +----> QBO
+                         |                         |
+                         +-------------------------+-----------------------+
+                                                   |
+                                                   v
+                    +----------------------------------------------------------------+
+                    |                 POSTGRESQL — AUTHORITATIVE                     |
+                    |----------------------------------------------------------------|
+                    | NetworkBusiness              source_business_ref               |
+                    | network_business_access      identity_resolution               |
+                    | resolution_candidates        business_add_operation            |
+                    | relationship_assertion       relationship_direction            |
+                    | business_relationship_view   identity_merge_event              |
+                    | merge snapshots              outbox_event                      |
+                    +-------------+----------------------+---------------------------+
+                                  |                      ^
+                                  |                      |
+                         MERGE_REQUESTED                 |
+                                  |                      |
+                                  v                      |
+                         +----------------+              |
+                         | outbox_event   |              |
+                         | PENDING        |              |
+                         +-------+--------+              |
+                                 |                       |
+                         atomic claim                    |
+                   PENDING -> PROCESSING                 |
+                                 |                       |
+                                 v                       |
+                      +----------------------+           |
+                      | Merge Consolidator   |-----------+
+                      |----------------------|
+                      | Move mappings        |
+                      | Canonicalize edges   |
+                      | Combine evidence     |
+                      | Collapse duplicates  |
+                      | Version / fencing    |
+                      +----------------------+
+
+DUPLICATE / MERGE PATH
+----------------------
+
+Identity Resolution
+       |
+       +---- two existing NetworkBusinessIds may represent same real business
+       |
+       v
+Duplicate Evaluation
+       |
+       | confirmed according to evidence / policy
+       v
+Merge Workflow
+       |
+       | SAME PostgreSQL transaction:
+       |   1. mark source SUPERSEDED
+       |   2. set canonical_business_id
+       |   3. write identity_merge_event + snapshots
+       |   4. insert MERGE_REQUESTED into outbox_event
+       v
+PostgreSQL
+       |
+       v
+outbox_event: PENDING
+       |
+       | SELECT ... FOR UPDATE SKIP LOCKED
+       | + UPDATE status = PROCESSING
+       | + COMMIT claim transaction
+       v
+Merge Consolidator
+       |
+       +---- mappings
+       +---- relationship assertions
+       +---- directional evidence
+       +---- duplicate logical edges
+       |
+       v
+PostgreSQL
+       |
+       +---- outbox_event = COMPLETED
+       +---- CONSOLIDATION_COMPLETED business-level guard
+
+
+TRANSACTION EVIDENCE PATH
+-------------------------
+
+QBO Raw Transactions
+        |
+        +---------------------------+
+        |                           |
+        v                           v
+Historical Bootstrap        CDC / Event Stream
+batch aggregate             Kafka/equivalent
+        |                           |
+        |                           v
+        |                 Transaction Evidence
+        |                 Processor
+        |                           |
+        +-------------+-------------+
+                      |
+              aggregate UPSERT
+                      |
+                      v
+            relationship_direction
+                      |
+                      v
+                 PostgreSQL
+
+
+AUTHORIZATION SYNC
+------------------
+
+QBO Identity / Entitlements
+      SOURCE OF TRUTH
+              |
+     +--------+---------+
+     |        |         |
+     v        v         v
+ Snapshot   Events   Reconcile
+     |        |         |
+     +--------+---------+
+              |
+              v
+     Authorization Sync
+              |
+      QBO company -> NB ID
+      role -> permission
+              |
+              v
+ network_business_access
+              |
+              v
+          PostgreSQL
+```
+
 ```mermaid
 flowchart TB
     UI["QuickBooks UI"]
