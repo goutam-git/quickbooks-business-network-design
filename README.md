@@ -68,6 +68,9 @@ real-world business. The network therefore operates on a canonical
 | Authorization           | Evaluated during traversal                                           |
 | Relationship topology   | Defined by active relationship assertions                            |
 | Transaction information | Directional evidence, not topology by itself                         |
+| Transaction ownership   | QBO remains authoritative for raw transaction-level financial data    |
+| Evidence ingestion      | Historical bootstrap + incremental CDC/event processing                |
+| Evidence storage        | Aggregate per directional business pair; no raw transaction copy       |
 | Cache                   | Optional optimization; never authoritative                           |
 | Graph database          | Future serving projection only if benchmarks justify it              |
 | AI                      | Candidate ranking/assistance; no direct authoritative graph mutation |
@@ -123,6 +126,11 @@ ML-based identity resolution.
 | A12 | Exact relationship provenance types are Product-defined; examples such as `USER`, `TRANSACTION`, and `IMPORT` are illustrative. |
 | A13 | Network-view compute budget is distinct from response-size budget.                                                              |
 | A14 | Point-to-point path search has a separate work budget from network expansion.                                                   |
+| A15 | QBO remains authoritative for raw transaction-level financial data.                                                            |
+| A16 | Business Network consumes transaction changes through a CDC/event contract or equivalent incremental feed; exact QBO integration is to be validated. |
+| A17 | Existing transaction history can be bootstrapped through a bounded batch aggregation rather than copied transaction-by-transaction. |
+| A18 | The incremental feed exposes a stable transaction/event identity, source version, or equivalent offset contract sufficient for replay-safe processing. |
+| A19 | Historical bootstrap and live processing meet at an explicit watermark/cutover position to prevent double counting.              |
 
 If QBO already owns a stable canonical cross-role business identifier,
 the identity layer becomes materially simpler: the network can adopt
@@ -155,7 +163,22 @@ Even a 50× burst is only roughly:
 Throughput alone therefore does **not** justify graph-specialized
 infrastructure.
 
-The more important issue is **traversal amplification**.
+Transaction evidence introduces a **separate scaling dimension** from network
+search QPS. The assignment does not provide QBO transaction throughput, so the
+design does not invent one. Raw transactions remain in QBO and Business Network
+stores compact directional aggregates. Evidence storage therefore scales with
+directional business pairs rather than raw transaction count.
+
+``` text
+READ / TRAVERSAL SCALE                 EVIDENCE INGESTION SCALE
+10M searches/month                     potentially very large QBO history
+<=100 direct relationships             continuous transaction changes
+bounded depth <=3                      replay / write-amplification concerns
+
+Primary risk: traversal amplification  Primary risk: ingest + DB write amplification
+```
+
+The more important issue on the read path is **traversal amplification**.
 
 At maximum degree 100, a naive expansion can approach:
 
@@ -207,7 +230,10 @@ flowchart TB
     OW["Outbox / Event Publisher"]
     SW["Source Association<br/>Retry Worker"]
     MW["Merge Consolidator"]
-    QBO["QBO Domain / APIs"]
+    QBO["QBO Domain / APIs<br/>Raw transaction authority"]
+    ES["CDC / Event Stream<br/>Kafka or equivalent"]
+    EP["Transaction Evidence Processor<br/>canonicalize • validate • dedupe • pre-aggregate"]
+    HB["Historical Bootstrap<br/>bounded batch aggregation"]
     REDIS[("Optional Redis<br/>Hot-neighborhood cache")]
 
     UI --> GW
@@ -224,6 +250,11 @@ flowchart TB
 
     RC --> QBO
     IR --> QBO
+    QBO --> ES
+    ES --> EP
+    QBO --> HB
+    HB --> PG
+    EP --> PG
     PG --> OW
     PG --> SW
     PG --> MW
@@ -462,18 +493,81 @@ counts.
 
 ------------------------------------------------------------------------
 
+------------------------------------------------------------------------
+
+## 7.3 Transaction Evidence Ingestion
+
+QBO remains the system of record for raw financial transactions. Business
+Network does **not** scan QBO transaction history during a graph read and does
+not copy every transaction into its PostgreSQL serving model.
+
+``` mermaid
+flowchart TD
+    QBO["QBO Transactions<br/>system of record"]
+    HIST["Historical Data"]
+    LIVE["New / Changed Transactions"]
+    BATCH["Bounded Batch Aggregation"]
+    STREAM["CDC / Event Stream<br/>Kafka or equivalent"]
+    EP["Transaction Evidence Processor<br/>resolve canonical IDs<br/>validate • dedupe • pre-aggregate"]
+    RD[("relationship_direction<br/>aggregate per directional pair")]
+    VIEW["business_relationship_view"]
+    QS["Network Query Service"]
+
+    QBO --> HIST --> BATCH --> RD
+    QBO --> LIVE --> STREAM --> EP --> RD
+    RD --> VIEW --> QS
+```
+
+Example:
+
+``` text
+T1  NB200 -> NB100  ₹10K
+T2  NB200 -> NB100  ₹20K
+T3  NB200 -> NB100  ₹30K
+            |
+            v
+short-window / batch aggregation
+            |
+            v
+NB200 -> NB100 | count=3 | amount=₹60K
+```
+
+### Scale and correctness properties
+
+- **Horizontal processing:** partition the stream by a stable business/account
+  key so evidence processors can scale horizontally.
+- **Pre-aggregation:** combine changes for the same directional pair before
+  batched PostgreSQL UPSERTs when needed.
+- **Replay safety:** redelivery must not increment count or amount twice; the
+  source needs a stable event/transaction identity, source version, or
+  equivalent offset contract.
+- **Historical bootstrap:** aggregate existing QBO history through a bounded
+  batch path.
+- **Bootstrap/live cutover:** use an explicit watermark/cutover position to
+  prevent double counting.
+- **Failure isolation:** quarantine/reconcile malformed or unresolved evidence
+  rather than corrupting the aggregate.
+
+The exact QBO event contract, throughput, retention, partition count, and
+change semantics are integration/capacity-planning details to validate with
+the QBO transaction domain.
+
+
 # 8. Data Model & ER Diagram
 
-The model separates five concerns:
+The model separates these core concerns:
 
-1.  canonical identity;
+1.  canonical business identity;
 2.  source-system mappings;
 3.  access control;
 4.  relationship existence/provenance;
-5.  directional business evidence.
+5.  directional transaction evidence;
+6.  identity-resolution audit;
+7.  durable mutation/orchestration state;
+8.  merge/consolidation history.
 
-It also persists resolution, add-operation, and merge state required for
-recovery and concurrency correctness.
+Raw QBO transactions are intentionally outside this model. Business Network
+stores only the derived evidence required for network serving.
 
 ``` mermaid
 erDiagram
@@ -751,6 +845,17 @@ one provenance source therefore does not necessarily remove the edge.
 
 Index the reverse endpoint order as required for aggregation.
 
+One row represents the aggregate for one **directional canonical business
+pair**, not one QBO transaction. For example, 100,000 raw QBO transactions
+between `NB200 -> NB100` can become one `relationship_direction` row containing
+the aggregate count, amount, and latest transaction time.
+
+This is the key scale boundary: graph-serving storage grows with directional
+business relationships rather than raw transaction volume. Replay/deduplication
+state belongs to the evidence-ingestion contract or dedicated processing state;
+redelivery must not double-increment `transaction_count` or
+`transaction_amount`.
+
 ### Why topology and transaction evidence are separate
 
 Historical transaction totals must not accidentally keep a relationship
@@ -942,6 +1047,13 @@ Unsafe reversal is rejected rather than guessed.
 | Redis unavailable                                      | Bypass cache and read authoritative store                                |
 | Future graph projection unavailable                    | Fall back to PostgreSQL authoritative path                               |
 | Identity ranker unavailable                            | Fail closed for ambiguity; deterministic evidence may continue           |
+| Transaction event delivered more than once              | Stable event identity/version/offset + idempotent/deduplicated aggregation |
+| Evidence processor crashes after processing             | Replay from committed stream position without double counting            |
+| PostgreSQL temporarily unavailable for evidence writes  | Durable stream retention + retry/backpressure                            |
+| Evidence consumers fall behind                          | Consumer-lag monitoring + horizontal scaling                             |
+| Historical bootstrap overlaps live stream               | Explicit watermark/cutover position                                      |
+| Transaction change arrives out of order                 | Source version/event-time semantics where required                       |
+| Transaction cannot resolve to canonical business IDs    | Quarantine/DLQ + reconciliation; do not corrupt aggregate                |
 
 ## Transactional outbox
 
@@ -1111,7 +1223,10 @@ flowchart TB
         HUMAN["Human Confirmation"]
     end
 
-    QBO["QBO Domain"]
+    QBO["QBO Domain<br/>raw transaction authority"]
+    EV["CDC / Event Stream"]
+    EP["Transaction Evidence Processor"]
+    HB["Historical Bootstrap"]
     REC["Reconciliation / Quality Jobs"]
 
     UI --> GW
@@ -1124,6 +1239,8 @@ flowchart TB
 
     CS --> PG
     CS --> QBO
+    QBO --> EV --> EP --> PG
+    QBO --> HB --> PG
 
     IRS --> RET --> RANK --> GATE
     GATE --> HUMAN
@@ -1328,6 +1445,22 @@ stale-fence retry rate
 reconciliation mismatches
 ```
 
+## Transaction evidence metrics
+
+``` text
+event ingest rate
+consumer lag / oldest event age
+events processed/sec
+duplicate/replay count
+failed or quarantined events
+pre-aggregation reduction ratio
+PostgreSQL aggregate UPSERT rate
+evidence processing latency
+bootstrap progress
+bootstrap/live watermark
+canonical-resolution failures
+```
+
 ## Identity metrics
 
 ``` text
@@ -1366,6 +1499,7 @@ When dependencies or capacity are constrained:
 | Separate compute/result budgets      | Protects system independently of UX response size | More query-policy machinery                         |
 | Active assertions define topology    | Clear provenance and lifecycle                    | More modeling than deriving edges from transactions |
 | Directional evidence kept separately | Preserves business reality                        | Serving projection requires aggregation             |
+| Aggregate evidence instead of copying raw transactions | Serving/storage scale follows business relationships, not transaction count | Requires reliable incremental feed, replay-safe aggregation, bootstrap and reconciliation |
 | No invented weight formula           | Avoids encoding unsupported Product semantics     | Weighted ranking deferred                           |
 | Transactional outbox                 | Reliable asynchronous evolution                   | Requires publisher/idempotent consumers             |
 | Async graph projection               | Avoids synchronous dual-write                     | Introduces eventual consistency                     |
@@ -1397,3 +1531,8 @@ the implementation evolves:
     gates.**
 10. **A new datastore is introduced because measured workloads require
     it, not because the domain happens to contain a graph.**
+11. **QBO remains authoritative for transaction-level financial data;
+    Business Network stores only the derived directional evidence required
+    for network serving.**
+12. **Transaction evidence processing is replay-safe: retries, redelivery,
+    and bootstrap/live overlap must not double-count directional aggregates.**
