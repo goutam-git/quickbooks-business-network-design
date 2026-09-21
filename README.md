@@ -213,53 +213,281 @@ small-depth query into uncontrolled work.
 
 # 4. V1 High-Level Architecture
 
-``` mermaid
-flowchart TB
-    UI["QuickBooks UI / Clients"]
-    GW["API Gateway<br/>Auth • Rate Limit • Request ID"]
+```text
+QUICKBOOKS UI
+                                            |
+                                            | HTTPS
+                                            v
+                              +---------------------------+
+                              | API Gateway               |
+                              |---------------------------|
+                              | Authentication            |
+                              | Rate Limiting / Tenant    |
+                              | Trusted Principal Context |
+                              +-------------+-------------+
+                                            |
+                             +--------------+--------------+
+                             |                             |
+                             |                             |
+                         READ PATH                     WRITE PATH
+                             |                             |
+                             v                             v
+                  +--------------------+        +----------------------+
+                  | Network Query      |        | Relationship Command |
+                  |--------------------|        |----------------------|
+                  | View Network       |        | Add Vendor / Client  |
+                  | Search Path        |        | Add / Retract Edge   |
+                  | Bounded BFS        |        | Idempotency          |
+                  | Rank / Paginate    |        | MANAGE AuthZ         |
+                  +---------+----------+        +----------+-----------+
+                            |                              |
+                            |                              | identity unknown
+                            |                              v
+                            |                   +------------------------+
+                            |                   | Identity Resolution    |
+                            |                   |------------------------|
+                            |                   | Normalize descriptor   |
+                            |                   | Candidate retrieval    |
+                            |                   | Deterministic signals  |
+                            |                   +-----------+------------+
+                            |                               |
+                            |                        ambiguous candidates
+                            |                               |
+                            |                               v
+                            |                   +------------------------+
+                            |                   | AI / ML Candidate      |
+                            |                   | Ranker                 |
+                            |                   |------------------------|
+                            |                   | Semantic similarity    |
+                            |                   | Candidate ranking      |
+                            |                   | Confidence / evidence  |
+                            |                   +-----------+------------+
+                            |                               |
+                            |              +----------------+----------------+
+                            |              |                |                |
+                            |              v                v                v
+                            |          +-------+       +----------+    +-------------+
+                            |          | MATCH |       | NO MATCH |    | CONFIRM     |
+                            |          +---+---+       +----+-----+    | REQUIRED    |
+                            |              |                |          +------+------+ 
+                            |              |                |                 |
+                            |              |                |                 v
+                            |              |                |          QuickBooks UI
+                            |              |                |          user decision
+                            |              |                |            /       \
+                            |              |                |           /         \
+                            |              |                |    Use Existing   Create New
+                            |              |                |          |             |
+                            |              v                |          |             |
+                            |       +--------------+        |          |             |
+                            |       | Reuse ACTIVE |<-------+----------+             |
+                            |       | Network      |        |                        |
+                            |       | BusinessId   |        |                        |
+                            |       +------+-------+        |                        |
+                            |              |                |                        |
+                            |              |                +------------------------+
+                            |              |                             |
+                            |              |                             v
+                            |              |                  +----------------------+
+                            |              |                  | Create NetworkBusiness|
+                            |              |                  | PENDING_SOURCE       |
+                            |              |                  +----------+-----------+
+                            |              |                             |
+                            |              |                    create / associate
+                            |              |                    QBO Vendor/Customer
+                            |              |                             |
+                            |              |                             v
+                            |              |                   +-------------------+
+                            |              |                   |    QBO DOMAIN     |
+                            |              |                   | SOURCE OF TRUTH   |
+                            |              |                   |-------------------|
+                            |              |                   | Vendor / Customer |
+                            |              |                   | Raw Transactions  |
+                            |              |                   +---------+---------+
+                            |              |                             |
+                            |              |                      +------+------+
+                            |              |                      |             |
+                            |              |                   SUCCESS       FAILURE
+                            |              |                      |             |
+                            |              |                      v             |
+                            |              |                Attach SourceRef    |
+                            |              |                Set ACTIVE          |
+                            |              |                      |             |
+                            |              +----------------------+             |
+                            |                                     |             |
+                            |                                     v             |
+                            |                         +----------------------+   |
+                            |                         | Relationship Command |   |
+                            |                         | continues            |   |
+                            |                         |----------------------|   |
+                            |                         | Canonicalize IDs     |   |
+                            |                         | Validate AuthZ       |   |
+                            |                         | Create Assertion     |   |
+                            |                         +----------+-----------+   |
+                            |                                    |               |
+                            +------------------+-----------------+               |
+                                               |                                 |
+                                               v                                 |
+                 +--------------------------------------------------------------------------+
+                 |                              POSTGRESQL                                  |
+                 |                             AUTHORITATIVE                                |
+                 |--------------------------------------------------------------------------|
+                 | NetworkBusiness              | relationship_assertion                    |
+                 | source_business_ref          | relationship_direction                    |
+                 | network_business_access      | business_relationship_view                |
+                 | identity_resolution          | identity_merge_event                      |
+                 | resolution_candidates        | merge snapshots                           |
+                 | business_add_operation       | outbox                                     |
+                 +--------------------+-------------------------+---------------------------+
+                                      |                         |
+                                      |                         |
+                               MERGE_REQUESTED             PENDING_SOURCE /
+                                outbox event            failed source association
+                                      |                         |
+                                      v                         v
+                            +------------------+       +----------------------+
+                            | Merge            |       | Source Association   |
+                            | Consolidator     |       | Retry Worker         |
+                            |------------------|       |----------------------|
+                            | Move mappings    |       | Retry idempotently   |
+                            | Canonicalize     |       | create / associate   |
+                            | assertions       |       | Vendor / Customer    |
+                            | Combine evidence |       +----------+-----------+
+                            | Collapse dupes   |                  |
+                            +--------+---------+                  |
+                                     |                            |
+                                     |                            v
+                                     |                  +-------------------+
+                                     |                  |    QBO DOMAIN     |
+                                     |                  | Vendor / Customer|
+                                     |                  +---------+---------+
+                                     |                            |
+                                     |                     source created
+                                     |                            |
+                                     v                            v
+                                PostgreSQL <----------------------+
+                                                         update SourceRef /
+                                                         ACTIVE / operation
 
-    subgraph BN["Business Network Services"]
-        QS["Network Query Service"]
-        RC["Relationship Command Service"]
-        IR["Identity Resolution Service"]
-        MC["Merge Coordinator"]
-    end
 
-    PG[("PostgreSQL<br/>AUTHORITATIVE<br/><br/>Identity + Source Refs<br/>Access Policy Data<br/>Relationship Assertions<br/>Directional Evidence<br/>Resolution Audit<br/>Merge State<br/>Outbox")]
+==========================================================================================
+                                  TRANSACTION EVIDENCE FLOW
+==========================================================================================
 
-    OW["Outbox / Event Publisher"]
-    SW["Source Association<br/>Retry Worker"]
-    MW["Merge Consolidator"]
-    QBO["QBO Domain / APIs<br/>Raw transaction authority"]
-    ES["CDC / Event Stream<br/>Kafka or equivalent"]
-    EP["Transaction Evidence Processor<br/>canonicalize • validate • dedupe • pre-aggregate"]
-    HB["Historical Bootstrap<br/>bounded batch aggregation"]
-    REDIS[("Optional Redis<br/>Hot-neighborhood cache")]
+                                      QBO DOMAIN
+                                  Raw Transactions
+                                        |
+                         +--------------+--------------+
+                         |                             |
+                         |                             |
+                         v                             v
+                +-------------------+          +-------------------+
+                | Historical        |          | CDC / Event       |
+                | Bootstrap         |          | Stream            |
+                |-------------------|          +---------+---------+
+                | Batch aggregate   |                    |
+                | existing history  |                    v
+                +---------+---------+          +-------------------------+
+                          |                    | Transaction Evidence    |
+                          |                    | Processor               |
+                          |                    |-------------------------|
+                          |                    | Resolve canonical IDs   |
+                          |                    | Validate                |
+                          |                    | Deduplicate / replay    |
+                          |                    | Pre-aggregate           |
+                          |                    | Idempotent processing   |
+                          |                    +------------+------------+
+                          |                                 |
+                          +----------------+----------------+
+                                           |
+                                           | aggregate UPSERT
+                                           v
+                              +----------------------------+
+                              | PostgreSQL                 |
+                              | relationship_direction     |
+                              |----------------------------|
+                              | seller_business_id         |
+                              | buyer_business_id          |
+                              | transaction_count          |
+                              | transaction_amount         |
+                              | last_transaction_at        |
+                              +-------------+--------------+
+                                            |
+                                            | +
+                                            | ACTIVE assertions
+                                            v
+                              +----------------------------+
+                              | business_relationship_view |
+                              | Undirected Serving View    |
+                              +-------------+--------------+
+                                            |
+                                            v
+                                      Network Query
 
-    UI --> GW
-    GW --> QS
-    GW --> RC
-    GW --> IR
 
-    QS --> PG
-    RC --> PG
-    IR --> PG
-    MC --> PG
+==========================================================================================
+                                     AUTHORIZATION FLOW
+==========================================================================================
 
-    QS -. cache hit/miss .-> REDIS
+                              QBO IDENTITY / ENTITLEMENTS
+                                     AUTHORITATIVE
+                                           |
+                        +------------------+------------------+
+                        |                  |                  |
+                        v                  v                  v
+                  Initial Snapshot    Real-time Events    Periodic Reconcile
+                        |                  |                  |
+                        +------------------+------------------+
+                                           |
+                                           v
+                                +----------------------+
+                                | Authorization Sync   |
+                                |----------------------|
+                                | Resolve QBO company  |
+                                | to NetworkBusiness   |
+                                | Map role→permission  |
+                                +----------+-----------+
+                                           |
+                                C456 -> NB100
+                                ADMIN -> MANAGE
+                                           |
+                                           v
+                              +---------------------------+
+                              | network_business_access   |
+                              |---------------------------|
+                              | P123 | NB100 | MANAGE     |
+                              | P123 | NB200 | VIEW       |
+                              +-------------+-------------+
+                                            |
+                                  +---------+---------+
+                                  |                   |
+                                  v                   v
+                           Network Query       Relationship Command
+                           VIEW at every       MANAGE for mutation
+                           BFS expansion
 
-    RC --> QBO
-    IR --> QBO
-    QBO --> ES
-    ES --> EP
-    QBO --> HB
-    HB --> PG
-    EP --> PG
-    PG --> OW
-    PG --> SW
-    PG --> MW
-    SW --> QBO
-    MW --> PG
+
+==========================================================================================
+                                    OPTIONAL / FUTURE
+==========================================================================================
+
+                 +---------------------------+       +---------------------------+
+                 | Redis                     |       | Neo4j                     |
+                 |---------------------------|       |---------------------------|
+                 | Hot-neighborhood cache    |       | Graph-serving projection |
+                 |                           |       |                           |
+                 | Only if skew benchmark    |       | Only if bounded traversal|
+                 | proves benefit            |       | / path benchmark fails   |
+                 +-------------+-------------+       +-------------+-------------+
+                               ^                                   ^
+                               |                                   |
+                        Network Query                    Projection Worker
+                                                                   ^
+                                                                   |
+                                                             Outbox events
+                                                                   |
+                                                              PostgreSQL
+                                                              AUTHORITATIVE
 ```
 
 ### Authority boundary
