@@ -538,163 +538,6 @@ flowchart TB
     NQ -.->|hot cache if justified| REDIS
 ```
 
-### V1 asynchronous-work model
-
-`MERGE_REQUESTED` does **not** imply Kafka. In V1, the authoritative merge decision and a `MERGE_REQUESTED` outbox_event row are committed atomically in the same PostgreSQL transaction. A PostgreSQL-backed Merge Consolidator polls/claims pending rows (for example with `FOR UPDATE SKIP LOCKED`), performs idempotent consolidation, and marks the work completed or failed. Kafka or another broker can be introduced later as an outbox_event publication target if throughput or integration fan-out justifies it.
-
-`PENDING_SOURCE` is durable operation state rather than a Kafka event. If QBO Vendor/Customer creation fails or times out, `business_add_operation` / the business status retains the incomplete operation. A Source Association Retry Worker polls eligible operations, retries the QBO association idempotently, and updates the same PostgreSQL state on success.
-
-The transaction-evidence path is separate: the production design may consume QBO transaction changes through CDC / an event stream (`Kafka/equivalent`), but that is an integration/evolution path and should not be presented as already implemented in the V1 reference code unless the corresponding producer/consumer exists.
-
-
-
-
-
-
-### PostgreSQL outbox physical schema
-
-The V1 asynchronous merge path uses a PostgreSQL-backed transactional outbox. The table is named `outbox_event`; Kafka is not required for merge correctness.
-
-```sql
-CREATE TABLE outbox_event (
-    event_id        UUID PRIMARY KEY,
-    event_type      VARCHAR(50) NOT NULL,
-    aggregate_type  VARCHAR(50) NOT NULL,
-    aggregate_id    UUID NOT NULL,
-    payload         JSONB NOT NULL,
-
-    status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-    attempt_count   INT NOT NULL DEFAULT 0,
-
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    available_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    claimed_at      TIMESTAMPTZ NULL,
-    processed_at    TIMESTAMPTZ NULL,
-    last_error      TEXT NULL,
-
-    CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'))
-);
-
-CREATE INDEX idx_outbox_event_pending
-ON outbox_event (event_type, available_at, created_at)
-WHERE status = 'PENDING';
-```
-
-A merge writes the canonical identity change, merge audit/snapshots, and the outbox event in the **same PostgreSQL transaction**:
-
-```sql
-BEGIN;
-
--- lock and validate source/target identities
--- mark source NetworkBusiness as SUPERSEDED
--- set canonical_business_id to the target
--- insert identity_merge_event
--- insert merge snapshots
-
-INSERT INTO outbox_event (
-    event_id,
-    event_type,
-    aggregate_type,
-    aggregate_id,
-    payload,
-    status
-)
-VALUES (
-    :event_id,
-    'MERGE_REQUESTED',
-    'NETWORK_BUSINESS',
-    :source_business_id,
-    :payload::jsonb,
-    'PENDING'
-);
-
-COMMIT;
-```
-
-Example logical row:
-
-| Column | Example |
-|---|---|
-| `event_id` | `E100` |
-| `event_type` | `MERGE_REQUESTED` |
-| `aggregate_type` | `NETWORK_BUSINESS` |
-| `aggregate_id` | `NB450` |
-| `payload` | `{"sourceBusinessId":"NB450","targetBusinessId":"NB200","mergeEventId":"M100"}` |
-| `status` | `PENDING` |
-| `attempt_count` | `0` |
-
-The Merge Consolidator claims pending work from PostgreSQL. Multiple worker instances can safely divide queue work using row locking:
-
-```sql
-BEGIN;
-
--- 1. Lock a bounded set of eligible rows so concurrent workers skip them.
-SELECT event_id
-FROM outbox_event
-WHERE event_type = 'MERGE_REQUESTED'
-  AND status = 'PENDING'
-  AND available_at <= CURRENT_TIMESTAMP
-ORDER BY created_at
-FOR UPDATE SKIP LOCKED
-LIMIT :batch_size;
-
--- 2. In the SAME transaction, durably record ownership before releasing locks.
-UPDATE outbox_event
-SET status = 'PROCESSING',
-    claimed_at = CURRENT_TIMESTAMP,
-    attempt_count = attempt_count + 1
-WHERE event_id = ANY(:claimed_ids);
-
-COMMIT;
-```
-
-Only after this claim transaction commits does the worker perform the potentially longer merge consolidation. This makes `PROCESSING` a real durable state rather than merely a row lock. A later poll cannot claim the same row while it remains `PROCESSING`.
-
-In an implementation, the select-and-update can also be expressed as a single PostgreSQL statement using a CTE with `UPDATE ... RETURNING`; the required invariant is the same: **selection and the transition to `PROCESSING` are atomic before consolidation starts**.
-
-Processing remains idempotent even though claiming prevents normal duplicate delivery. After successful consolidation the worker marks the event `COMPLETED` and sets `processed_at`.
-
-For a retryable failure, the worker must not immediately expose the same row to a tight retry loop. It transitions the row back to `PENDING`, records `last_error`, clears the claim, and moves `available_at` forward using a bounded backoff policy derived from `attempt_count`:
-
-```sql
-UPDATE outbox_event
-SET status = 'PENDING',
-    claimed_at = NULL,
-    last_error = :last_error,
-    available_at = CURRENT_TIMESTAMP + :backoff_interval
-WHERE event_id = :event_id
-  AND status = 'PROCESSING';
-```
-
-Conceptually, `backoff_interval = backoff(attempt_count)`; the exact base delay, multiplier, jitter, and cap are operational configuration rather than hard-coded architecture assumptions.
-
-Retry exhaustion is also explicit configuration. Define a `max_attempts` policy parameter (value TBD from operational requirements). When a failure is classified as permanent, or `attempt_count >= max_attempts`, transition the event to `FAILED` instead of returning it to `PENDING`, and surface it through metrics/alerts and an operator-visible recovery path.
-
-There are deliberately **two layers of idempotency**. The `outbox_event` lifecycle (`PENDING → PROCESSING → COMPLETED`) is the transport/work-queue guard that prevents the same outbox row from being processed repeatedly. The Merge Consolidator's existing `identity_merge_event` / `CONSOLIDATION_COMPLETED` check is a second, business-level guard: if the same `merge_operation_id` is accidentally re-queued in a different outbox row with a new `event_id`, the merge decision is still not consolidated twice.
-
-The ownership distinction is intentional:
-
-```text
-MERGE_REQUESTED
-      |
-      v
-outbox_event
-      |
-      v
-Merge Consolidator
-
-PENDING_SOURCE
-      |
-      v
-network_business.status
-+ business_add_operation.state
-      |
-      v
-Source Association Retry Worker
-```
-
-`MERGE_REQUESTED` represents durable asynchronous work caused by an already committed merge decision. `PENDING_SOURCE` represents an incomplete Add Vendor/Customer operation that must be resumed; it is not a merge outbox event.
-
 ### Authority boundary
 
 PostgreSQL owns authoritative Business Network state.
@@ -1461,6 +1304,163 @@ reversal when it remains unambiguous.
 Unsafe reversal is rejected rather than guessed.
 
 ------------------------------------------------------------------------
+
+### V1 asynchronous-work model
+
+`MERGE_REQUESTED` does **not** imply Kafka. In V1, the authoritative merge decision and a `MERGE_REQUESTED` outbox_event row are committed atomically in the same PostgreSQL transaction. A PostgreSQL-backed Merge Consolidator polls/claims pending rows (for example with `FOR UPDATE SKIP LOCKED`), performs idempotent consolidation, and marks the work completed or failed. Kafka or another broker can be introduced later as an outbox_event publication target if throughput or integration fan-out justifies it.
+
+`PENDING_SOURCE` is durable operation state rather than a Kafka event. If QBO Vendor/Customer creation fails or times out, `business_add_operation` / the business status retains the incomplete operation. A Source Association Retry Worker polls eligible operations, retries the QBO association idempotently, and updates the same PostgreSQL state on success.
+
+The transaction-evidence path is separate: the production design may consume QBO transaction changes through CDC / an event stream (`Kafka/equivalent`), but that is an integration/evolution path and should not be presented as already implemented in the V1 reference code unless the corresponding producer/consumer exists.
+
+
+
+
+
+
+### PostgreSQL outbox physical schema
+
+The V1 asynchronous merge path uses a PostgreSQL-backed transactional outbox. The table is named `outbox_event`; Kafka is not required for merge correctness.
+
+```sql
+CREATE TABLE outbox_event (
+    event_id        UUID PRIMARY KEY,
+    event_type      VARCHAR(50) NOT NULL,
+    aggregate_type  VARCHAR(50) NOT NULL,
+    aggregate_id    UUID NOT NULL,
+    payload         JSONB NOT NULL,
+
+    status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    attempt_count   INT NOT NULL DEFAULT 0,
+
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    available_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    claimed_at      TIMESTAMPTZ NULL,
+    processed_at    TIMESTAMPTZ NULL,
+    last_error      TEXT NULL,
+
+    CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'))
+);
+
+CREATE INDEX idx_outbox_event_pending
+ON outbox_event (event_type, available_at, created_at)
+WHERE status = 'PENDING';
+```
+
+A merge writes the canonical identity change, merge audit/snapshots, and the outbox event in the **same PostgreSQL transaction**:
+
+```sql
+BEGIN;
+
+-- lock and validate source/target identities
+-- mark source NetworkBusiness as SUPERSEDED
+-- set canonical_business_id to the target
+-- insert identity_merge_event
+-- insert merge snapshots
+
+INSERT INTO outbox_event (
+    event_id,
+    event_type,
+    aggregate_type,
+    aggregate_id,
+    payload,
+    status
+)
+VALUES (
+    :event_id,
+    'MERGE_REQUESTED',
+    'NETWORK_BUSINESS',
+    :source_business_id,
+    :payload::jsonb,
+    'PENDING'
+);
+
+COMMIT;
+```
+
+Example logical row:
+
+| Column | Example |
+|---|---|
+| `event_id` | `E100` |
+| `event_type` | `MERGE_REQUESTED` |
+| `aggregate_type` | `NETWORK_BUSINESS` |
+| `aggregate_id` | `NB450` |
+| `payload` | `{"sourceBusinessId":"NB450","targetBusinessId":"NB200","mergeEventId":"M100"}` |
+| `status` | `PENDING` |
+| `attempt_count` | `0` |
+
+The Merge Consolidator claims pending work from PostgreSQL. Multiple worker instances can safely divide queue work using row locking:
+
+```sql
+BEGIN;
+
+-- 1. Lock a bounded set of eligible rows so concurrent workers skip them.
+SELECT event_id
+FROM outbox_event
+WHERE event_type = 'MERGE_REQUESTED'
+  AND status = 'PENDING'
+  AND available_at <= CURRENT_TIMESTAMP
+ORDER BY created_at
+FOR UPDATE SKIP LOCKED
+LIMIT :batch_size;
+
+-- 2. In the SAME transaction, durably record ownership before releasing locks.
+UPDATE outbox_event
+SET status = 'PROCESSING',
+    claimed_at = CURRENT_TIMESTAMP,
+    attempt_count = attempt_count + 1
+WHERE event_id = ANY(:claimed_ids);
+
+COMMIT;
+```
+
+Only after this claim transaction commits does the worker perform the potentially longer merge consolidation. This makes `PROCESSING` a real durable state rather than merely a row lock. A later poll cannot claim the same row while it remains `PROCESSING`.
+
+In an implementation, the select-and-update can also be expressed as a single PostgreSQL statement using a CTE with `UPDATE ... RETURNING`; the required invariant is the same: **selection and the transition to `PROCESSING` are atomic before consolidation starts**.
+
+Processing remains idempotent even though claiming prevents normal duplicate delivery. After successful consolidation the worker marks the event `COMPLETED` and sets `processed_at`.
+
+For a retryable failure, the worker must not immediately expose the same row to a tight retry loop. It transitions the row back to `PENDING`, records `last_error`, clears the claim, and moves `available_at` forward using a bounded backoff policy derived from `attempt_count`:
+
+```sql
+UPDATE outbox_event
+SET status = 'PENDING',
+    claimed_at = NULL,
+    last_error = :last_error,
+    available_at = CURRENT_TIMESTAMP + :backoff_interval
+WHERE event_id = :event_id
+  AND status = 'PROCESSING';
+```
+
+Conceptually, `backoff_interval = backoff(attempt_count)`; the exact base delay, multiplier, jitter, and cap are operational configuration rather than hard-coded architecture assumptions.
+
+Retry exhaustion is also explicit configuration. Define a `max_attempts` policy parameter (value TBD from operational requirements). When a failure is classified as permanent, or `attempt_count >= max_attempts`, transition the event to `FAILED` instead of returning it to `PENDING`, and surface it through metrics/alerts and an operator-visible recovery path.
+
+There are deliberately **two layers of idempotency**. The `outbox_event` lifecycle (`PENDING → PROCESSING → COMPLETED`) is the transport/work-queue guard that prevents the same outbox row from being processed repeatedly. The Merge Consolidator's existing `identity_merge_event` / `CONSOLIDATION_COMPLETED` check is a second, business-level guard: if the same `merge_operation_id` is accidentally re-queued in a different outbox row with a new `event_id`, the merge decision is still not consolidated twice.
+
+The ownership distinction is intentional:
+
+```text
+MERGE_REQUESTED
+      |
+      v
+outbox_event
+      |
+      v
+Merge Consolidator
+
+PENDING_SOURCE
+      |
+      v
+network_business.status
++ business_add_operation.state
+      |
+      v
+Source Association Retry Worker
+```
+
+`MERGE_REQUESTED` represents durable asynchronous work caused by an already committed merge decision. `PENDING_SOURCE` represents an incomplete Add Vendor/Customer operation that must be resumed; it is not a merge outbox event.
 
 # 12. Reliability & Failure Handling
 
