@@ -213,282 +213,269 @@ small-depth query into uncontrolled work.
 
 # 4. V1 High-Level Architecture
 
-```text
-QUICKBOOKS UI
-                                            |
-                                            | HTTPS
-                                            v
-                              +---------------------------+
-                              | API Gateway               |
-                              |---------------------------|
-                              | Authentication            |
-                              | Rate Limiting / Tenant    |
-                              | Trusted Principal Context |
-                              +-------------+-------------+
-                                            |
-                             +--------------+--------------+
-                             |                             |
-                             |                             |
-                         READ PATH                     WRITE PATH
-                             |                             |
-                             v                             v
-                  +--------------------+        +----------------------+
-                  | Network Query      |        | Relationship Command |
-                  |--------------------|        |----------------------|
-                  | View Network       |        | Add Vendor / Client  |
-                  | Search Path        |        | Add / Retract Edge   |
-                  | Bounded BFS        |        | Idempotency          |
-                  | Rank / Paginate    |        | MANAGE AuthZ         |
-                  +---------+----------+        +----------+-----------+
-                            |                              |
-                            |                              | identity unknown
-                            |                              v
-                            |                   +------------------------+
-                            |                   | Identity Resolution    |
-                            |                   |------------------------|
-                            |                   | Normalize descriptor   |
-                            |                   | Candidate retrieval    |
-                            |                   | Deterministic signals  |
-                            |                   +-----------+------------+
-                            |                               |
-                            |                        ambiguous candidates
-                            |                               |
-                            |                               v
-                            |                   +------------------------+
-                            |                   | AI / ML Candidate      |
-                            |                   | Ranker                 |
-                            |                   |------------------------|
-                            |                   | Semantic similarity    |
-                            |                   | Candidate ranking      |
-                            |                   | Confidence / evidence  |
-                            |                   +-----------+------------+
-                            |                               |
-                            |              +----------------+----------------+
-                            |              |                |                |
-                            |              v                v                v
-                            |          +-------+       +----------+    +-------------+
-                            |          | MATCH |       | NO MATCH |    | CONFIRM     |
-                            |          +---+---+       +----+-----+    | REQUIRED    |
-                            |              |                |          +------+------+ 
-                            |              |                |                 |
-                            |              |                |                 v
-                            |              |                |          QuickBooks UI
-                            |              |                |          user decision
-                            |              |                |            /       \
-                            |              |                |           /         \
-                            |              |                |    Use Existing   Create New
-                            |              |                |          |             |
-                            |              v                |          |             |
-                            |       +--------------+        |          |             |
-                            |       | Reuse ACTIVE |<-------+----------+             |
-                            |       | Network      |        |                        |
-                            |       | BusinessId   |        |                        |
-                            |       +------+-------+        |                        |
-                            |              |                |                        |
-                            |              |                +------------------------+
-                            |              |                             |
-                            |              |                             v
-                            |              |                  +----------------------+
-                            |              |                  | Create NetworkBusiness|
-                            |              |                  | PENDING_SOURCE       |
-                            |              |                  +----------+-----------+
-                            |              |                             |
-                            |              |                    create / associate
-                            |              |                    QBO Vendor/Customer
-                            |              |                             |
-                            |              |                             v
-                            |              |                   +-------------------+
-                            |              |                   |    QBO DOMAIN     |
-                            |              |                   | SOURCE OF TRUTH   |
-                            |              |                   |-------------------|
-                            |              |                   | Vendor / Customer |
-                            |              |                   | Raw Transactions  |
-                            |              |                   +---------+---------+
-                            |              |                             |
-                            |              |                      +------+------+
-                            |              |                      |             |
-                            |              |                   SUCCESS       FAILURE
-                            |              |                      |             |
-                            |              |                      v             |
-                            |              |                Attach SourceRef    |
-                            |              |                Set ACTIVE          |
-                            |              |                      |             |
-                            |              +----------------------+             |
-                            |                                     |             |
-                            |                                     v             |
-                            |                         +----------------------+   |
-                            |                         | Relationship Command |   |
-                            |                         | continues            |   |
-                            |                         |----------------------|   |
-                            |                         | Canonicalize IDs     |   |
-                            |                         | Validate AuthZ       |   |
-                            |                         | Create Assertion     |   |
-                            |                         +----------+-----------+   |
-                            |                                    |               |
-                            +------------------+-----------------+               |
-                                               |                                 |
-                                               v                                 |
-                 +--------------------------------------------------------------------------+
-                 |                              POSTGRESQL                                  |
-                 |                             AUTHORITATIVE                                |
-                 |--------------------------------------------------------------------------|
-                 | NetworkBusiness              | relationship_assertion                    |
-                 | source_business_ref          | relationship_direction                    |
-                 | network_business_access      | business_relationship_view                |
-                 | identity_resolution          | identity_merge_event                      |
-                 | resolution_candidates        | merge snapshots                           |
-                 | business_add_operation       | outbox                                     |
-                 +--------------------+-------------------------+---------------------------+
-                                      |                         |
-                                      |                         |
-                               MERGE_REQUESTED             PENDING_SOURCE /
-                                outbox event            failed source association
-                                      |                         |
-                                      v                         v
-                            +------------------+       +----------------------+
-                            | Merge            |       | Source Association   |
-                            | Consolidator     |       | Retry Worker         |
-                            |------------------|       |----------------------|
-                            | Move mappings    |       | Retry idempotently   |
-                            | Canonicalize     |       | create / associate   |
-                            | assertions       |       | Vendor / Customer    |
-                            | Combine evidence |       +----------+-----------+
-                            | Collapse dupes   |                  |
-                            +--------+---------+                  |
-                                     |                            |
-                                     |                            v
-                                     |                  +-------------------+
-                                     |                  |    QBO DOMAIN     |
-                                     |                  | Vendor / Customer|
-                                     |                  +---------+---------+
-                                     |                            |
-                                     |                     source created
-                                     |                            |
-                                     v                            v
-                                PostgreSQL <----------------------+
-                                                         update SourceRef /
-                                                         ACTIVE / operation
+```mermaid
+flowchart TB
+    UI["QuickBooks UI"]
+    GW["API Gateway<br/>Authentication<br/>Rate Limiting<br/>Trusted Principal Context"]
 
+    NQ["Network Query<br/>View Network<br/>Search Path<br/>Bounded BFS<br/>Rank / Paginate"]
+    RC["Relationship Command<br/>Add Vendor / Client<br/>Add / Retract Edge<br/>Idempotency<br/>MANAGE AuthZ"]
 
-==========================================================================================
-                                  TRANSACTION EVIDENCE FLOW
-==========================================================================================
+    IR["Identity Resolution<br/>Normalize descriptor<br/>Candidate retrieval<br/>Deterministic signals"]
+    CM["Candidate Matching<br/>Ambiguous input candidates"]
+    AIR["AI / ML Candidate Ranker<br/>Semantic similarity<br/>Candidate ranking<br/>Confidence / evidence"]
+    MATCH["MATCH"]
+    NOMATCH["NO_MATCH"]
+    CONFIRM["CONFIRM_REQUIRED"]
+    HUMAN{"Human Decision"}
+    REUSE["Reuse Existing<br/>NetworkBusinessId"]
+    CREATE["Create NetworkBusiness<br/>PENDING_SOURCE"]
 
-                                      QBO DOMAIN
-                                  Raw Transactions
-                                        |
-                         +--------------+--------------+
-                         |                             |
-                         |                             |
-                         v                             v
-                +-------------------+          +-------------------+
-                | Historical        |          | CDC / Event       |
-                | Bootstrap         |          | Stream            |
-                |-------------------|          +---------+---------+
-                | Batch aggregate   |                    |
-                | existing history  |                    v
-                +---------+---------+          +-------------------------+
-                          |                    | Transaction Evidence    |
-                          |                    | Processor               |
-                          |                    |-------------------------|
-                          |                    | Resolve canonical IDs   |
-                          |                    | Validate                |
-                          |                    | Deduplicate / replay    |
-                          |                    | Pre-aggregate           |
-                          |                    | Idempotent processing   |
-                          |                    +------------+------------+
-                          |                                 |
-                          +----------------+----------------+
-                                           |
-                                           | aggregate UPSERT
-                                           v
-                              +----------------------------+
-                              | PostgreSQL                 |
-                              | relationship_direction     |
-                              |----------------------------|
-                              | seller_business_id         |
-                              | buyer_business_id          |
-                              | transaction_count          |
-                              | transaction_amount         |
-                              | last_transaction_at        |
-                              +-------------+--------------+
-                                            |
-                                            | +
-                                            | ACTIVE assertions
-                                            v
-                              +----------------------------+
-                              | business_relationship_view |
-                              | Undirected Serving View    |
-                              +-------------+--------------+
-                                            |
-                                            v
-                                      Network Query
+    DE["Duplicate Evaluation<br/>Existing NetworkBusinessIds<br/>Evidence / policy<br/>Confirmation"]
+    MW["Merge Workflow<br/>Validate roots<br/>Lock identities<br/>Record merge decision"]
 
+    QBO["QBO Vendor / Customer Domain<br/>SOURCE OF TRUTH"]
+    SUCCESS["SourceRef + ACTIVE"]
+    FAILURE["Source creation failed"]
+    CONTINUE["Relationship Command continues<br/>Canonicalize IDs<br/>Validate AuthZ<br/>Create Assertion"]
 
-==========================================================================================
-                                     AUTHORIZATION FLOW
-==========================================================================================
+    PG[("PostgreSQL — AUTHORITATIVE<br/><br/>NetworkBusiness · source_business_ref<br/>network_business_access · identity_resolution<br/>resolution_candidates · business_add_operation<br/>relationship_assertion · relationship_direction<br/>business_relationship_view<br/>identity_merge_event · merge snapshots")]
 
-                              QBO IDENTITY / ENTITLEMENTS
-                                     AUTHORITATIVE
-                                           |
-                        +------------------+------------------+
-                        |                  |                  |
-                        v                  v                  v
-                  Initial Snapshot    Real-time Events    Periodic Reconcile
-                        |                  |                  |
-                        +------------------+------------------+
-                                           |
-                                           v
-                                +----------------------+
-                                | Authorization Sync   |
-                                |----------------------|
-                                | Resolve QBO company  |
-                                | to NetworkBusiness   |
-                                | Map role→permission  |
-                                +----------+-----------+
-                                           |
-                                C456 -> NB100
-                                ADMIN -> MANAGE
-                                           |
-                                           v
-                              +---------------------------+
-                              | network_business_access   |
-                              |---------------------------|
-                              | P123 | NB100 | MANAGE     |
-                              | P123 | NB200 | VIEW       |
-                              +-------------+-------------+
-                                            |
-                                  +---------+---------+
-                                  |                   |
-                                  v                   v
-                           Network Query       Relationship Command
-                           VIEW at every       MANAGE for mutation
-                           BFS expansion
+    OUTBOX["PostgreSQL outbox_event<br/>MERGE_REQUESTED<br/>PENDING → PROCESSING → COMPLETED / FAILED"]
+    ADDOP["Durable Add Operation<br/>SOURCE_PENDING / retry state"]
 
+    MC["Merge Consolidator<br/>PostgreSQL-backed worker<br/>Move mappings<br/>Canonicalize edges<br/>Combine evidence<br/>Collapse duplicates<br/>Version / fencing"]
+    SR["Source Association Retry Worker<br/>PostgreSQL-backed worker<br/>Retry idempotently<br/>Create / associate Vendor / Customer"]
 
-==========================================================================================
-                                    OPTIONAL / FUTURE
-==========================================================================================
+    QTX["QBO Raw Transactions"]
+    HB["Historical Bootstrap<br/>Batch aggregate"]
+    CDC["CDC / Event Stream<br/>Kafka/equivalent — production integration"]
+    TEP["Transaction Evidence Processor<br/>Resolve canonical IDs<br/>Validate<br/>Deduplicate / replay<br/>Pre-aggregate<br/>Idempotent processing"]
 
-                 +---------------------------+       +---------------------------+
-                 | Redis                     |       | Neo4j                     |
-                 |---------------------------|       |---------------------------|
-                 | Hot-neighborhood cache    |       | Graph-serving projection |
-                 |                           |       |                           |
-                 | Only if skew benchmark    |       | Only if bounded traversal|
-                 | proves benefit            |       | / path benchmark fails   |
-                 +-------------+-------------+       +-------------+-------------+
-                               ^                                   ^
-                               |                                   |
-                        Network Query                    Projection Worker
-                                                                   ^
-                                                                   |
-                                                             Outbox events
-                                                                   |
-                                                              PostgreSQL
-                                                              AUTHORITATIVE
+    QAUTH["QBO Identity / Entitlements<br/>AUTHORITATIVE"]
+    SNAP["Initial Snapshot"]
+    EVT["Real-time Events"]
+    REC["Periodic Reconcile"]
+    AS["Authorization Sync<br/>Resolve QBO company → NetworkBusinessId<br/>Map role → permission"]
+
+    REDIS["Redis<br/>Hot-neighborhood cache<br/>Benchmark-gated<br/>Not authoritative"]
+    NEO["Neo4j<br/>Graph-serving projection<br/>Benchmark-gated<br/>Not authoritative"]
+    PW["Projection Worker"]
+
+    UI --> GW
+    GW -->|Read| NQ
+    GW -->|Write| RC
+    NQ --> PG
+    RC -->|identity unknown| IR
+
+    IR --> CM
+    IR -->|two existing identities may be duplicates| DE
+    CM --> AIR
+    AIR --> MATCH
+    AIR --> NOMATCH
+    AIR --> CONFIRM
+
+    MATCH --> REUSE
+    NOMATCH --> CREATE
+    CONFIRM --> HUMAN
+    HUMAN -->|Use Existing| REUSE
+    HUMAN -->|Create New| CREATE
+
+    REUSE --> CONTINUE
+    CREATE -->|create / associate source| QBO
+    QBO -->|success| SUCCESS
+    QBO -->|failure| FAILURE
+    SUCCESS --> CONTINUE
+    CONTINUE --> PG
+    FAILURE -->|persist retry state| ADDOP
+    ADDOP --> PG
+
+    DE -->|duplicate confirmed| MW
+    MW -->|same DB transaction: canonical merge + outbox_event row| PG
+    PG --> OUTBOX
+    OUTBOX -->|poll / claim with SKIP LOCKED| MC
+    MC -->|idempotent consolidation| PG
+
+    PG --> ADDOP
+    ADDOP -->|poll / retry| SR
+    SR -->|retry source association| QBO
+    QBO -->|retry succeeds| PG
+
+    QTX --> HB
+    QTX --> CDC
+    HB -->|aggregate UPSERT| PG
+    CDC --> TEP
+    TEP -->|aggregate UPSERT| PG
+
+    QAUTH --> SNAP
+    QAUTH --> EVT
+    QAUTH --> REC
+    SNAP --> AS
+    EVT --> AS
+    REC --> AS
+    AS -->|authorization projection| PG
+
+    OUTBOX -.->|future publisher if needed| PW
+    PW -.->|benchmark-gated| NEO
+    NQ -.->|hot cache if justified| REDIS
 ```
+
+### V1 asynchronous-work model
+
+`MERGE_REQUESTED` does **not** imply Kafka. In V1, the authoritative merge decision and a `MERGE_REQUESTED` outbox_event row are committed atomically in the same PostgreSQL transaction. A PostgreSQL-backed Merge Consolidator polls/claims pending rows (for example with `FOR UPDATE SKIP LOCKED`), performs idempotent consolidation, and marks the work completed or failed. Kafka or another broker can be introduced later as an outbox_event publication target if throughput or integration fan-out justifies it.
+
+`PENDING_SOURCE` is durable operation state rather than a Kafka event. If QBO Vendor/Customer creation fails or times out, `business_add_operation` / the business status retains the incomplete operation. A Source Association Retry Worker polls eligible operations, retries the QBO association idempotently, and updates the same PostgreSQL state on success.
+
+The transaction-evidence path is separate: the production design may consume QBO transaction changes through CDC / an event stream (`Kafka/equivalent`), but that is an integration/evolution path and should not be presented as already implemented in the V1 reference code unless the corresponding producer/consumer exists.
+
+
+
+
+
+
+### PostgreSQL outbox physical schema
+
+The V1 asynchronous merge path uses a PostgreSQL-backed transactional outbox. The table is named `outbox_event`; Kafka is not required for merge correctness.
+
+```sql
+CREATE TABLE outbox_event (
+    event_id        UUID PRIMARY KEY,
+    event_type      VARCHAR(50) NOT NULL,
+    aggregate_type  VARCHAR(50) NOT NULL,
+    aggregate_id    UUID NOT NULL,
+    payload         JSONB NOT NULL,
+
+    status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    attempt_count   INT NOT NULL DEFAULT 0,
+
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    available_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    claimed_at      TIMESTAMPTZ NULL,
+    processed_at    TIMESTAMPTZ NULL,
+    last_error      TEXT NULL,
+
+    CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'))
+);
+
+CREATE INDEX idx_outbox_event_pending
+ON outbox_event (event_type, available_at, created_at)
+WHERE status = 'PENDING';
+```
+
+A merge writes the canonical identity change, merge audit/snapshots, and the outbox event in the **same PostgreSQL transaction**:
+
+```sql
+BEGIN;
+
+-- lock and validate source/target identities
+-- mark source NetworkBusiness as SUPERSEDED
+-- set canonical_business_id to the target
+-- insert identity_merge_event
+-- insert merge snapshots
+
+INSERT INTO outbox_event (
+    event_id,
+    event_type,
+    aggregate_type,
+    aggregate_id,
+    payload,
+    status
+)
+VALUES (
+    :event_id,
+    'MERGE_REQUESTED',
+    'NETWORK_BUSINESS',
+    :source_business_id,
+    :payload::jsonb,
+    'PENDING'
+);
+
+COMMIT;
+```
+
+Example logical row:
+
+| Column | Example |
+|---|---|
+| `event_id` | `E100` |
+| `event_type` | `MERGE_REQUESTED` |
+| `aggregate_type` | `NETWORK_BUSINESS` |
+| `aggregate_id` | `NB450` |
+| `payload` | `{"sourceBusinessId":"NB450","targetBusinessId":"NB200","mergeEventId":"M100"}` |
+| `status` | `PENDING` |
+| `attempt_count` | `0` |
+
+The Merge Consolidator claims pending work from PostgreSQL. Multiple worker instances can safely divide queue work using row locking:
+
+```sql
+BEGIN;
+
+-- 1. Lock a bounded set of eligible rows so concurrent workers skip them.
+SELECT event_id
+FROM outbox_event
+WHERE event_type = 'MERGE_REQUESTED'
+  AND status = 'PENDING'
+  AND available_at <= CURRENT_TIMESTAMP
+ORDER BY created_at
+FOR UPDATE SKIP LOCKED
+LIMIT :batch_size;
+
+-- 2. In the SAME transaction, durably record ownership before releasing locks.
+UPDATE outbox_event
+SET status = 'PROCESSING',
+    claimed_at = CURRENT_TIMESTAMP,
+    attempt_count = attempt_count + 1
+WHERE event_id = ANY(:claimed_ids);
+
+COMMIT;
+```
+
+Only after this claim transaction commits does the worker perform the potentially longer merge consolidation. This makes `PROCESSING` a real durable state rather than merely a row lock. A later poll cannot claim the same row while it remains `PROCESSING`.
+
+In an implementation, the select-and-update can also be expressed as a single PostgreSQL statement using a CTE with `UPDATE ... RETURNING`; the required invariant is the same: **selection and the transition to `PROCESSING` are atomic before consolidation starts**.
+
+Processing remains idempotent even though claiming prevents normal duplicate delivery. After successful consolidation the worker marks the event `COMPLETED` and sets `processed_at`.
+
+For a retryable failure, the worker must not immediately expose the same row to a tight retry loop. It transitions the row back to `PENDING`, records `last_error`, clears the claim, and moves `available_at` forward using a bounded backoff policy derived from `attempt_count`:
+
+```sql
+UPDATE outbox_event
+SET status = 'PENDING',
+    claimed_at = NULL,
+    last_error = :last_error,
+    available_at = CURRENT_TIMESTAMP + :backoff_interval
+WHERE event_id = :event_id
+  AND status = 'PROCESSING';
+```
+
+Conceptually, `backoff_interval = backoff(attempt_count)`; the exact base delay, multiplier, jitter, and cap are operational configuration rather than hard-coded architecture assumptions.
+
+Retry exhaustion is also explicit configuration. Define a `max_attempts` policy parameter (value TBD from operational requirements). When a failure is classified as permanent, or `attempt_count >= max_attempts`, transition the event to `FAILED` instead of returning it to `PENDING`, and surface it through metrics/alerts and an operator-visible recovery path.
+
+There are deliberately **two layers of idempotency**. The `outbox_event` lifecycle (`PENDING → PROCESSING → COMPLETED`) is the transport/work-queue guard that prevents the same outbox row from being processed repeatedly. The Merge Consolidator's existing `identity_merge_event` / `CONSOLIDATION_COMPLETED` check is a second, business-level guard: if the same `merge_operation_id` is accidentally re-queued in a different outbox row with a new `event_id`, the merge decision is still not consolidated twice.
+
+The ownership distinction is intentional:
+
+```text
+MERGE_REQUESTED
+      |
+      v
+outbox_event
+      |
+      v
+Merge Consolidator
+
+PENDING_SOURCE
+      |
+      v
+network_business.status
++ business_add_operation.state
+      |
+      v
+Source Association Retry Worker
+```
+
+`MERGE_REQUESTED` represents durable asynchronous work caused by an already committed merge decision. `PENDING_SOURCE` represents an incomplete Add Vendor/Customer operation that must be resumed; it is not a merge outbox event.
 
 ### Authority boundary
 
@@ -1212,7 +1199,7 @@ flowchart TD
     F["Record immutable MERGE_CONFIRMED event"]
     G["Capture assertion + direction snapshots"]
     H["Set source SUPERSEDED<br/>canonical -> target<br/>increment fence/version"]
-    I["Write outbox merge work"]
+    I["Write outbox_event merge work"]
     J["COMMIT"]
     K["Async Merge Consolidator"]
     L["Validate expected roots + versions"]
@@ -1283,7 +1270,7 @@ Unsafe reversal is rejected rather than guessed.
 | Transaction change arrives out of order                 | Source version/event-time semantics where required                       |
 | Transaction cannot resolve to canonical business IDs    | Quarantine/DLQ + reconciliation; do not corrupt aggregate                |
 
-## Transactional outbox
+## Transactional outbox_event
 
 Authoritative state change and event publication intent are committed
 together.
@@ -1292,16 +1279,16 @@ together.
 sequenceDiagram
     participant S as Service
     participant PG as PostgreSQL
-    participant P as Outbox Publisher
+    participant P as outbox_event Publisher
     participant D as Downstream Projection/Worker
 
     S->>PG: BEGIN
     S->>PG: Write authoritative state
-    S->>PG: Write outbox event
+    S->>PG: Write outbox_event event
     S->>PG: COMMIT
     PG-->>S: Success
 
-    P->>PG: Read unpublished outbox rows
+    P->>PG: Read unpublished outbox_event rows
     P->>D: Publish idempotently
     P->>PG: Mark published
 ```
@@ -1438,7 +1425,7 @@ flowchart TB
     end
 
     PG[("PostgreSQL<br/>AUTHORITATIVE SOURCE OF TRUTH")]
-    OUT["Transactional Outbox"]
+    OUT["Transactional outbox_event"]
     PUB["Projection Publisher"]
 
     REDIS[("Optional Redis<br/>hot-neighborhood cache")]
@@ -1508,7 +1495,7 @@ benchmarks show that relational traversal cannot meet the required
 envelope safely or maintainably.
 
 The graph store receives changes asynchronously from the authoritative
-outbox.
+outbox_event.
 
 Consequences are explicit:
 
@@ -1664,7 +1651,7 @@ cache hit rate
 
 ``` text
 idempotent replay rate
-outbox backlog / oldest age
+outbox_event backlog / oldest age
 PENDING_SOURCE count and age
 source-association retry count
 merge backlog
@@ -1729,7 +1716,7 @@ When dependencies or capacity are constrained:
 | Directional evidence kept separately | Preserves business reality                        | Serving projection requires aggregation             |
 | Aggregate evidence instead of copying raw transactions | Serving/storage scale follows business relationships, not transaction count | Requires reliable incremental feed, replay-safe aggregation, bootstrap and reconciliation |
 | No invented weight formula           | Avoids encoding unsupported Product semantics     | Weighted ranking deferred                           |
-| Transactional outbox                 | Reliable asynchronous evolution                   | Requires publisher/idempotent consumers             |
+| Transactional outbox_event                 | Reliable asynchronous evolution                   | Requires publisher/idempotent consumers             |
 | Async graph projection               | Avoids synchronous dual-write                     | Introduces eventual consistency                     |
 | AI as ranking assistant              | Improves resolution while retaining control       | Requires evaluation/audit/confirmation              |
 | Merge snapshots + fencing            | Safe recovery/concurrency                         | Additional storage and workflow complexity          |
