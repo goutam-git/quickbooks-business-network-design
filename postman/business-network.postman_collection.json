@@ -1,0 +1,553 @@
+{
+  "info": {
+    "name": "QuickBooks Business Network - V1 (+ AI Resolution)",
+    "_postman_id": "b1a1b3a0-0000-4000-8000-000000000001",
+    "description": "Run 'docker compose up --build' from the repo root first. Uses the seeded businesses below (loaded via db/test-data/V3__seed_test_data.sql).\n\nSeeded NetworkBusinessIds (principal 'demo-user' has MANAGE on all):\n- Acme Supplies Pvt Ltd  = 11111111-1111-1111-1111-111111111111\n- Bharat Traders         = 22222222-2222-2222-2222-222222222222\n- Chennai Textiles       = 33333333-3333-3333-3333-333333333333\n- Delta Logistics        = 44444444-4444-4444-4444-444444444444\n- Everest Hardware       = 55555555-5555-5555-5555-555555555555\n\nSeeded edges: Acme-Bharat, Bharat-Chennai, Chennai-Delta.\n\nRequests 6->6b and 10->11 auto-capture their ids via a small test script (see each request's Tests tab) -- Run Collection works end-to-end with zero manual copy-paste. Note: re-running the FULL collection against a database that already has an earlier successful run's data (e.g. Everest already merged into Delta) will correctly return 409 on requests 7 and 10 the second time -- that's the merge/self-relationship invariants working as designed, not a bug. Run 'docker compose down -v && docker compose up --build' first for a clean run.\n\nRequests 13-15 demo the AI ranking enhancement (Section 12). It runs with\nzero external setup by default (local n-gram fallback backend) -- set\nOPENAI_API_KEY before 'docker compose up' to switch to real OpenAI\nembeddings with no other config change.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "aiUrl",
+      "value": "http://localhost:8090"
+    },
+    {
+      "key": "principal",
+      "value": "demo-user"
+    },
+    {
+      "key": "businessA",
+      "value": "11111111-1111-1111-1111-111111111111"
+    },
+    {
+      "key": "businessB",
+      "value": "22222222-2222-2222-2222-222222222222"
+    },
+    {
+      "key": "businessD",
+      "value": "44444444-4444-4444-4444-444444444444"
+    },
+    {
+      "key": "businessE",
+      "value": "55555555-5555-5555-5555-555555555555"
+    },
+    {
+      "key": "confirmOperationId",
+      "value": ""
+    },
+    {
+      "key": "mergeOperationId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health check",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/actuator/health"
+      }
+    },
+    {
+      "name": "2. Resolve - MATCH (exact seeded name)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": "{{baseUrl}}/businesses/resolve",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceSystem\": \"QBO\",\n  \"sourceEntityType\": \"VENDOR\",\n  \"sourceEntityId\": \"V-9999\",\n  \"displayName\": \"Acme Supplies Pvt Ltd\"\n}"
+        }
+      }
+    },
+    {
+      "name": "3. Resolve - CONFIRM_REQUIRED (close but not exact)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": "{{baseUrl}}/businesses/resolve",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceSystem\": \"QBO\",\n  \"sourceEntityType\": \"VENDOR\",\n  \"sourceEntityId\": \"V-9998\",\n  \"displayName\": \"Bharat Trader\"\n}"
+        }
+      }
+    },
+    {
+      "name": "4. Resolve - NO_MATCH (brand new business)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": "{{baseUrl}}/businesses/resolve",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceSystem\": \"QBO\",\n  \"sourceEntityType\": \"CUSTOMER\",\n  \"sourceEntityId\": \"C-7777\",\n  \"displayName\": \"Zenith Freight Solutions\"\n}"
+        }
+      }
+    },
+    {
+      "name": "5. Add Vendor - NO_MATCH path (creates new NetworkBusiness + relationship)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "add-vendor-demo-001"
+          }
+        ],
+        "url": "{{baseUrl}}/businesses/{{businessA}}/vendors",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceSystem\": \"QBO\",\n  \"sourceEntityType\": \"VENDOR\",\n  \"sourceEntityId\": \"\",\n  \"displayName\": \"Zenith Freight Solutions\",\n  \"relationshipSourceType\": \"USER\",\n  \"relationshipSourceReference\": \"add-vendor-demo-001\"\n}"
+        }
+      }
+    },
+    {
+      "name": "5b. Add Vendor - replay same Idempotency-Key (should return same result)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "add-vendor-demo-001"
+          }
+        ],
+        "url": "{{baseUrl}}/businesses/{{businessA}}/vendors",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceSystem\": \"QBO\",\n  \"sourceEntityType\": \"VENDOR\",\n  \"sourceEntityId\": \"\",\n  \"displayName\": \"Zenith Freight Solutions\",\n  \"relationshipSourceType\": \"USER\",\n  \"relationshipSourceReference\": \"add-vendor-demo-001\"\n}"
+        }
+      }
+    },
+    {
+      "name": "6. Add Vendor - CONFIRM_REQUIRED path (ambiguous name)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "add-vendor-demo-002"
+          }
+        ],
+        "url": "{{baseUrl}}/businesses/{{businessA}}/vendors",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceSystem\": \"QBO\",\n  \"sourceEntityType\": \"CUSTOMER\",\n  \"sourceEntityId\": \"\",\n  \"displayName\": \"Bharat Trader\",\n  \"relationshipSourceType\": \"USER\",\n  \"relationshipSourceReference\": \"add-vendor-demo-002\"\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Auto-captures the id from this response into a collection variable",
+              "// so the next dependent request (6b/11) works in a full 'Run Collection'",
+              "// pass with no manual copy-paste needed.",
+              "if (pm.response.code === 200 || pm.response.code === 201 || pm.response.code === 202) {",
+              "    const body = pm.response.json();",
+              "    if (body.operationId) {",
+              "        pm.collectionVariables.set('confirmOperationId', body.operationId);",
+              "        console.log('Captured confirmOperationId:', body.operationId);",
+              "    }",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "6b. Confirm Add Vendor - USE_EXISTING (auto-captures operationId from step 6)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": "{{baseUrl}}/businesses/{{businessA}}/vendors/confirm",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"operationId\": \"{{confirmOperationId}}\",\n  \"decision\": \"USE_EXISTING\",\n  \"selectedNetworkBusinessId\": \"{{businessB}}\"\n}"
+        }
+      }
+    },
+    {
+      "name": "7. Create Relationship (lower-level command)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "rel-demo-001"
+          }
+        ],
+        "url": "{{baseUrl}}/relationships",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"businessAId\": \"{{businessD}}\",\n  \"businessBId\": \"{{businessE}}\",\n  \"sourceType\": \"USER\",\n  \"sourceReference\": \"rel-demo-001\"\n}"
+        }
+      }
+    },
+    {
+      "name": "8. Network View (FR1) - depth 2 from Acme",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/businesses/{{businessA}}/network?depth=2",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "businesses",
+            "{{businessA}}",
+            "network"
+          ],
+          "query": [
+            {
+              "key": "depth",
+              "value": "2"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "8b. Network View - INVALID_DEPTH (400)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/businesses/{{businessA}}/network?depth=99",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "businesses",
+            "{{businessA}}",
+            "network"
+          ],
+          "query": [
+            {
+              "key": "depth",
+              "value": "99"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "9. Path Search (FR2) - Acme to Delta (connected)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/relationships/path?from={{businessA}}&to={{businessD}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "relationships",
+            "path"
+          ],
+          "query": [
+            {
+              "key": "from",
+              "value": "{{businessA}}"
+            },
+            {
+              "key": "to",
+              "value": "{{businessD}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "9b. Path Search - NOT_FOUND_WITHIN_DEPTH (maxDepth=1, too far)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/relationships/path?from={{businessA}}&to={{businessD}}&maxDepth=1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "relationships",
+            "path"
+          ],
+          "query": [
+            {
+              "key": "from",
+              "value": "{{businessA}}"
+            },
+            {
+              "key": "to",
+              "value": "{{businessD}}"
+            },
+            {
+              "key": "maxDepth",
+              "value": "1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "10. Merge - confirm merge Everest into Delta",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": "{{baseUrl}}/business-identity/merges",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceBusinessId\": \"{{businessE}}\",\n  \"targetBusinessId\": \"{{businessD}}\",\n  \"reason\": \"Duplicate identity found during onboarding\"\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Auto-captures the id from this response into a collection variable",
+              "// so the next dependent request (6b/11) works in a full 'Run Collection'",
+              "// pass with no manual copy-paste needed.",
+              "if (pm.response.code === 200 || pm.response.code === 201 || pm.response.code === 202) {",
+              "    const body = pm.response.json();",
+              "    if (body.mergeOperationId) {",
+              "        pm.collectionVariables.set('mergeOperationId', body.mergeOperationId);",
+              "        console.log('Captured mergeOperationId:', body.mergeOperationId);",
+              "    }",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "10b. Network View after merge (Everest's edges now show under Delta)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/businesses/{{businessD}}/network?depth=2",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "businesses",
+            "{{businessD}}",
+            "network"
+          ],
+          "query": [
+            {
+              "key": "depth",
+              "value": "2"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "11. Reverse Merge (auto-captures mergeOperationId from step 10)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": "{{baseUrl}}/business-identity/merges/{{mergeOperationId}}/reverse",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"reason\": \"Merged in error\"\n}"
+        }
+      }
+    },
+    {
+      "name": "12. Unauthorized principal - 404 not 403 (Section 14)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Principal-Id",
+            "value": "someone-else"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/businesses/{{businessA}}/network?depth=1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "businesses",
+            "{{businessA}}",
+            "network"
+          ],
+          "query": [
+            {
+              "key": "depth",
+              "value": "1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "13. AI Resolution health check (standalone)",
+      "request": {
+        "method": "GET",
+        "url": "{{aiUrl}}/health"
+      }
+    },
+    {
+      "name": "14. AI Resolution - direct /rank call (the live-demo case: fallback gets this ONE wrong)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{aiUrl}}/rank",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"ABC Consulting\",\n  \"candidates\": [\n    { \"id\": \"cand-1\", \"name\": \"ABC Consultancy Services LLP\" },\n    { \"id\": \"cand-2\", \"name\": \"XYZ Consulting Group\" },\n    { \"id\": \"cand-3\", \"name\": \"ABD Consulting\" }\n  ]\n}"
+        }
+      },
+      "response": [],
+      "description": "With the default local NGRAM_FALLBACK backend, this ranks cand-3 (\"ABD Consulting\" -- a near-identical misspelling) above cand-1 (\"ABC Consultancy Services LLP\" -- the actually correct, differently-worded match). That's a real, honest limitation of lexical similarity, not a bug. Set OPENAI_API_KEY, restart the ai-resolution container, and re-run this exact request: a real embedding model should rank cand-1 first. That before/after IS the AI-ranking demo."
+    },
+    {
+      "name": "15. Resolve through the app - see blended AI evidence in the response",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Principal-Id",
+            "value": "{{principal}}"
+          }
+        ],
+        "url": "{{baseUrl}}/businesses/resolve",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceSystem\": \"QBO\",\n  \"sourceEntityType\": \"VENDOR\",\n  \"sourceEntityId\": \"V-9997\",\n  \"displayName\": \"Everest Hardware Pvt Ltd\"\n}"
+        }
+      },
+      "description": "Look at each candidate's `evidence` field in the response: it contains deterministicScore, aiScore, aiBackend, aiModel and blendedScore side by side -- the concrete proof the AI enhancement ran and influenced (or didn't) the final decision. Compare this response's `evidence.aiBackend` before/after setting OPENAI_API_KEY and restarting the ai-resolution container."
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: business-network
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:business_network}
+    username: ${DB_USER:bn_user}
+    password: ${DB_PASSWORD:bn_password}
+    hikari:
+      maximum-pool-size: 10
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: false
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+business-network:
+  traversal:
+    max-depth: 3
+    max-explored-nodes: 5000
+    max-explored-edges: 20000
+    max-returned-nodes: 200
+    max-returned-edges: 500
+    default-page-size: 50
+  path-search:
+    max-depth: 4
+    max-explored-nodes: 5000
+  ai-resolution:
+    enabled: ${AI_RESOLUTION_ENABLED:true}
+    url: ${AI_RESOLUTION_URL:http://localhost:8090/rank}
+    connect-timeout-ms: 1000
+    read-timeout-ms: 4000
+    # Weight given to the AI/ML re-ranking score when blending with the
+    # deterministic score (0 = ignore AI even if reachable, 1 = AI only).
+    blend-weight: 0.5
+
+logging:
+  level:
+    com.quickbooks.biznetwork: INFO

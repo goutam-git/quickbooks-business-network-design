@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bn-postgres
+    environment:
+      POSTGRES_DB: business_network
+      POSTGRES_USER: bn_user
+      POSTGRES_PASSWORD: bn_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - bn_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bn_user -d business_network"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ai-resolution:
+    build:
+      context: ./ai-resolution/ranking
+    container_name: bn-ai-resolution
+    environment:
+      # Leave unset to use the local, dependency-free n-gram fallback
+      # backend (no external calls, no key needed -- safe default for a
+      # live demo). Set this to a real key to switch that same service to
+      # OpenAI embeddings without touching any other config.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+    ports:
+      - "8091:8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: service/Dockerfile
+    container_name: bn-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-resolution:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: business_network
+      DB_USER: bn_user
+      DB_PASSWORD: bn_password
+      AI_RESOLUTION_ENABLED: "true"
+      AI_RESOLUTION_URL: http://ai-resolution:8090/rank
+    ports:
+      - "8080:8080"
+
+volumes:
+  bn_pg_data:
