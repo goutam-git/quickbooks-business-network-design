@@ -59,7 +59,7 @@ configuration or schema change, not a rewrite.
 | A2  | Does the Business Network need its own identity layer?                                           | Yes — introduces `NetworkBusinessId` unifying Vendor/Customer references                                                                                                                                                                                                                                                                                                                                            | Our architectural choice, weakly supported by “already exist in the network” wording in use case 3 | Medium (design confidence: High — this is what we’re building) | Very High                                                                               |
 | A3  | Can multiple typed source records map to one NetworkBusiness?                                    | Yes                                                                                                                                                                                                                                                                                                                                                                                                                 | Follows from A1/A2                                                                                 | Medium                                                         | High                                                                                    |
 | A4  | Max network-view traversal depth                                                                 | Bounded, initial default 3 hops, server-capped and rejects out-of-range requests                                                                                                                                                                                                                                                                                                                                    | Our assumption                                                                                     | Low                                                            | Medium                                                                                  |
-| A5  | Relationship search semantics                                                                    | Return path (not just boolean), shortest by **hop count**, not by weight                                                                                                                                                                                                                                                                                                                                            | Our assumption; weight-as-cost is semantically undefined by the prompt                             | Low                                                            | Medium                                                                                  |
+| A5  | Relationship search semantics                                                                    | Return a bounded authorized relationship path when one is found. Exact path-selection/ranking semantics are Product-defined; do not assume transaction volume is path cost or invent shortest-path semantics not required by the prompt                                                                                                                                                                                                                                                                                                                                            | Our assumption; weight-as-cost is semantically undefined by the prompt                             | Low                                                            | Medium                                                                                  |
 | A6  | Relationship freshness                                                                           | Undecided — PostgreSQL-only V1 supports strong/read-your-writes; eventual projection remains an evolution option                                                                                                                                                                                                                                                                                                    | Asked Intuit (Q4)                                                                                  | Low                                                            | Medium for PostgreSQL-only V1; High only if a separate serving projection is introduced |
 | A7  | Is authorization required during traversal?                                                      | Yes                                                                                                                                                                                                                                                                                                                                                                                                                 | Security requirement we impose for sensitive financial relationship data                           | **High**                                                       | High                                                                                    |
 | A8  | Authorization model / edge-visibility rule                                                       | Provisional: both endpoints must be visible to the principal for an edge to be traversable (conservative default)                                                                                                                                                                                                                                                                                                   | Not specified by Intuit; our conservative V1 choice                                                | Low                                                            | High                                                                                    |
@@ -165,12 +165,13 @@ ranked and paginated for UI consumption. Traversal is additionally bounded by
 separately by `maxReturnedNodes`, `maxReturnedEdges`, and page size.
 
 **FR2 — Search relationship** `GET /relationships/path?from=A&to=B` —
-shortest path by **hop count**. Weight represents relationship
-*strength*, not traversal *cost*; using transaction amount as edge cost
-is semantically undefined (a ₹10M edge could mean “closer” or “further”
-with no basis to choose). If no path is found within the search’s depth
-budget, the response is `NOT_FOUND_WITHIN_DEPTH` (searched-but-bounded),
-never `NOT_CONNECTED` (a stronger claim than what was proven).
+return a bounded, authorized relationship path when one is found. Exact
+path-selection/ranking semantics are Product-defined. Transaction volume is
+preserved as relationship evidence/weight input, but V1 does not assume it is
+path cost or invent shortest-path semantics not required by the prompt. If no
+path is found within the search boundary, the response is
+`NOT_FOUND_WITHIN_DEPTH` (searched-but-bounded), never `NOT_CONNECTED` (a
+stronger claim than what was proven).
 
 **FR3 — Add vendor/client relationship** Add a business as a
 vendor/client, resolving identity before creating the relationship (see
@@ -277,7 +278,7 @@ requirements), scoped to a defined work budget (see Section 9.4):
 | Direct neighborhood       | ≤ 100 ms               |
 | 2-hop bounded network     | ≤ 250 ms               |
 | 3-hop bounded network     | ≤ 500 ms               |
-| Bounded shortest-hop path | ≤ 750 ms               |
+| Bounded relationship path | ≤ 750 ms               |
 
 These targets apply only under a defined traversal-depth + explored-node
 budget + authorization-filtering cost — not to arbitrary unbounded
@@ -745,7 +746,7 @@ volume.
 | Direct relationships     | Excellent  | Excellent  | Excellent          |
 | Bounded 2-hop            | Good       | Excellent  | Excellent          |
 | Repeated multi-hop       | Fair/Good  | Excellent  | Excellent          |
-| Shortest path            | Fair       | Excellent  | Excellent          |
+| Bounded path traversal    | Fair/Good  | Excellent  | Excellent          |
 | Transactional simplicity | Excellent  | Good       | Fair               |
 | Read-after-write         | Simple     | Simple     | Harder             |
 | Operational complexity   | Lowest     | Low/Medium | Highest            |
@@ -787,9 +788,7 @@ WITH RECURSIVE network AS (
 ...
 ```
 
-Shortest-hop path is PostgreSQL’s weakest fit (BFS is not SQL’s natural
-access pattern) but is implementable and not disqualifying at this
-scale.
+Bounded path traversal is a weaker fit for PostgreSQL than direct adjacency, but it is implementable at this scale and must be validated against the defined work and latency budgets.
 
 ### 9.4 Making the decision falsifiable
 
