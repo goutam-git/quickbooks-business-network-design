@@ -1,435 +1,846 @@
-# QuickBooks Business Network — Technical Design Reference
+# QuickBooks Business Network — System Design
 
-> **Purpose:** Panel-facing engineering deep dive accompanying the Craft
-> System Design presentation.  
-> **Status:** Provisional V1 design. PostgreSQL-first authoritative
-> architecture with explicit evolution seams.  
-> **Scope:** Business identity, relationship topology, bounded
-> traversal, reliability, AI-assisted entity resolution, and
-> evidence-driven evolution.
+**Craft System Design — Senior Staff Builder**  
+Status: **Provisional V1 design; implementation baseline frozen.** Open assumptions A2, A6, and A12 do not block implementation. A6 and A12 are isolated behind stable interfaces; A2 is different — if QuickBooks already provides a canonical cross-role business identity, the identity subsystem simplifies materially rather than merely reconfiguring. It is still safe to proceed provisionally because the graph, relationship, traversal, authorization, and API boundaries operate on `NetworkBusinessId` regardless of who ultimately owns that identity.
 
 ------------------------------------------------------------------------
 
-## Contents
+## 1. Problem Statement
 
-1.  [Design Summary](#1-design-summary)
-2.  [Problem, Requirements &
-    Assumptions](#2-problem-requirements--assumptions)
-3.  [Scale & Architectural Drivers](#3-scale--architectural-drivers)
-4.  [V1 High-Level Architecture](#4-v1-high-level-architecture)
-5.  [Canonical Business Identity](#5-canonical-business-identity)
-6.  [AI-Assisted Identity
-    Resolution](#6-ai-assisted-identity-resolution)
-7.  [Core Write & Read Flows](#7-core-write--read-flows)
-8.  [Data Model & ER Diagram](#8-data-model--er-diagram)
-9.  [Physical PostgreSQL Schema](#9-physical-postgresql-schema)
-10. [Relationship Semantics &
-    Traversal](#10-relationship-semantics--traversal)
-11. [Identity Merge & Concurrency](#11-identity-merge--concurrency)
-12. [Reliability & Failure Handling](#12-reliability--failure-handling)
-13. [Datastore Decision & Falsifiable Pivot
-    Criteria](#13-datastore-decision--falsifiable-pivot-criteria)
-14. [Evolution Architecture](#14-evolution-architecture)
-15. [API Surface](#15-api-surface)
-16. [Security, Privacy &
-    Authorization](#16-security-privacy--authorization)
-17. [Observability & Operations](#17-observability--operations)
-18. [Key Trade-offs](#18-key-trade-offs)
+Design a system within QuickBooks that maps a business’s network of
+vendor/client relationships, so a business can:
+
+1.  **View its network** — a map of vendors and clients.
+2.  **Search a specific relationship** — direct and indirect connections
+    between two businesses.
+3.  **Grow the network** — add a new vendor/client, which may or may not
+    already exist under a different descriptor.
+4.  **Stay highly available and responsive.**
+
+Given constraints: ~1M businesses, ≤100 direct relationships/business,
+10M relationship searches/month, undirected relationships weighted by
+transaction volume, non-uniform (skewed) traffic.
 
 ------------------------------------------------------------------------
 
-# 1. Design Summary
+## 2. Clarifying Questions Sent to Intuit
 
-QuickBooks Business Network allows a business to:
+1.  Is a business network view bounded to a fixed number of hops, or
+    must it support arbitrary-depth exploration?
+2.  For “search a specific relationship,” is a boolean connectivity
+    answer sufficient, or is a path/route between the two businesses
+    required?
+3.  When a new business is added and might already exist under a
+    different descriptor, is automatic high-confidence matching
+    acceptable, or must ambiguous matches always require human
+    confirmation?
+4.  Must a newly created relationship be visible in every subsequent
+    read immediately (strong consistency), or is brief propagation delay
+    acceptable?
+5.  Is graph traversal expected to enforce per-business authorization
+    (i.e., can a business see relationships it isn’t a party to)?
+6.  *(Not yet sent — pending)* Does QuickBooks already expose a
+    canonical business identity shared across Vendor and Customer
+    records, or must the Business Network resolve multiple
+    Vendor/Customer descriptors into its own network-level business
+    identity?
 
-- view its business network;
-- determine whether another business is directly or indirectly related;
-- inspect a bounded relationship path;
-- add a vendor/client even when the same real business appears under
-  different descriptors;
-- preserve privacy while traversing relationships;
-- remain responsive under highly skewed graph topology.
-
-The key design decision is to **separate canonical business identity
-from QuickBooks role-oriented source records**.
-
-A QuickBooks Vendor and a QuickBooks Customer may represent the same
-real-world business. The network therefore operates on a canonical
-`NetworkBusinessId`, while retaining mappings back to source records.
-
-### V1 principles
-
-| Principle               | V1 decision                                                          |
-|-------------------------|----------------------------------------------------------------------|
-| System of record        | PostgreSQL                                                           |
-| Graph depth             | Server-capped, initially `<= 3` hops                                 |
-| Path semantics          | Shortest path by hop count                                           |
-| Identity ambiguity      | Human confirmation; no ambiguous auto-merge                          |
-| Authorization           | Evaluated during traversal                                           |
-| Relationship topology   | Defined by active relationship assertions                            |
-| Transaction information | Directional evidence, not topology by itself                         |
-| Transaction ownership   | QBO remains authoritative for raw transaction-level financial data    |
-| Evidence ingestion      | Historical bootstrap + incremental CDC/event processing                |
-| Evidence storage        | Aggregate per directional business pair; no raw transaction copy       |
-| Cache                   | Optional optimization; never authoritative                           |
-| Graph database          | Future serving projection only if benchmarks justify it              |
-| AI                      | Candidate ranking/assistance; no direct authoritative graph mutation |
-
-The architecture deliberately keeps V1 operationally simple while
-leaving explicit seams for Redis, graph-native serving, and improved
-ML-based identity resolution.
+Until answered, the design below proceeds on documented provisional
+assumptions (Section 3), each isolated so a wrong guess is a
+configuration or schema change, not a rewrite.
 
 ------------------------------------------------------------------------
 
-# 2. Problem, Requirements & Assumptions
+## 3. Assumption Register
 
-## Functional requirements
+| ID  | Question                                                                                         | Working assumption                                                                                                                                                                                                                                                                                                                                                                                                  | Basis                                                                                              | Confidence                                                     | Pivot cost                                                                              |
+|:----|:-------------------------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:---------------------------------------------------------------------------------------------------|:---------------------------------------------------------------|:----------------------------------------------------------------------------------------|
+| A1  | What does QBO’s source identity model look like?                                                 | Role-oriented records (Vendor, Customer) — no single canonical cross-role Business ID                                                                                                                                                                                                                                                                                                                               | Public QBO domain model                                                                            | High (as a fact about QBO)                                     | —                                                                                       |
+| A2  | Does the Business Network need its own identity layer?                                           | Yes — introduces `NetworkBusinessId` unifying Vendor/Customer references                                                                                                                                                                                                                                                                                                                                            | Our architectural choice, weakly supported by “already exist in the network” wording in use case 3 | Medium (design confidence: High — this is what we’re building) | Very High                                                                               |
+| A3  | Can multiple typed source records map to one NetworkBusiness?                                    | Yes                                                                                                                                                                                                                                                                                                                                                                                                                 | Follows from A1/A2                                                                                 | Medium                                                         | High                                                                                    |
+| A4  | Max network-view traversal depth                                                                 | Bounded, initial default 3 hops, server-capped and rejects out-of-range requests                                                                                                                                                                                                                                                                                                                                    | Our assumption                                                                                     | Low                                                            | Medium                                                                                  |
+| A5  | Relationship search semantics                                                                    | Return path (not just boolean), shortest by **hop count**, not by weight                                                                                                                                                                                                                                                                                                                                            | Our assumption; weight-as-cost is semantically undefined by the prompt                             | Low                                                            | Medium                                                                                  |
+| A6  | Relationship freshness                                                                           | Undecided — PostgreSQL-only V1 supports strong/read-your-writes; eventual projection remains an evolution option                                                                                                                                                                                                                                                                                                    | Asked Intuit (Q4)                                                                                  | Low                                                            | Medium for PostgreSQL-only V1; High only if a separate serving projection is introduced |
+| A7  | Is authorization required during traversal?                                                      | Yes                                                                                                                                                                                                                                                                                                                                                                                                                 | Security requirement we impose for sensitive financial relationship data                           | **High**                                                       | High                                                                                    |
+| A8  | Authorization model / edge-visibility rule                                                       | Provisional: both endpoints must be visible to the principal for an edge to be traversable (conservative default)                                                                                                                                                                                                                                                                                                   | Not specified by Intuit; our conservative V1 choice                                                | Low                                                            | High                                                                                    |
+| A9  | Ambiguous identity handling                                                                      | Uncertain matches always require user confirmation; never auto-merge in V1                                                                                                                                                                                                                                                                                                                                          | Deliberate V1 safety policy                                                                        | **High** (deliberate choice, not uncertainty)                  | Medium                                                                                  |
+| A10 | Resolution transport | **Synchronous in V1** — `POST /businesses/resolve` returns `MATCH / NO_MATCH / CONFIRM_REQUIRED` directly. Async candidate-generation is an evolution only if benchmarking shows the interactive latency budget cannot be met | Deliberate V1 simplification; logical resolution contract remains transport-independent | Medium | Low |
+| A11 | Relationship weight formula                                                                      | Undecided — preserve raw aggregates (`transactionCount`, `transactionAmount`, `lastTransactionAt`); do not invent a derived formula at architecture time                                                                                                                                                                                                                                                            | Prompt says “weighted by transaction volume” but doesn’t define it                                 | Low                                                            | Low                                                                                     |
+| A12 | Relationship source (who/what creates an assertion)                                              | **Undecided — largest remaining write-path gap.** Modeled to support USER, TRANSACTION, and IMPORT provenance simultaneously                                                                                                                                                                                                                                                                                        | Not established by prompt                                                                          | Low                                                            | Medium                                                                                  |
+| A13 | Network-view query budget (nodes/edges/timeout)                                                  | Undecided — must be derived from UX (how many nodes can a human meaningfully view), not invented                                                                                                                                                                                                                                                                                                                    | Product/UX-dependent                                                                               | Low                                                            | Low                                                                                     |
+| A14 | Path-search query budget                                                                         | Independent of A13 — different UX, different tolerance                                                                                                                                                                                                                                                                                                                                                              | Different access pattern                                                                           | Medium                                                         | Low                                                                                     |
+| A15 | Who’s authoritative for source-record data                                                       | QBO remains authoritative for Vendor/Customer records and their attributes                                                                                                                                                                                                                                                                                                                                          | Design boundary we impose                                                                          | High                                                           | High                                                                                    |
+| A16 | Who owns identity unification / mapping                                                          | Business Network owns `NetworkBusiness`, source mappings, and merge decisions                                                                                                                                                                                                                                                                                                                                       | Follows from A2/A3                                                                                 | Medium                                                         | Very High                                                                               |
+| A17 | Edge-visibility policy for traversal                                                             | Conservative default: an edge A↔B is only traversable if the principal can see **both** A and B                                                                                                                                                                                                                                                                                                                     | No Intuit guidance; chosen to fail toward under-disclosure, not over-disclosure                    | Low (policy is provisional; the *need* for a rule is not)      | Medium                                                                                  |
+| A18 | Does the P95 benchmark include authorization cost?                                               | Yes — authorization predicate evaluation is counted as part of “work performed” in every benchmark run                                                                                                                                                                                                                                                                                                              | Otherwise the spike measures an unrepresentative query                                             | High                                                           | —                                                                                       |
+| A19 | Does path search distinguish “no path exists” from “path exists but runs through a hidden node”? | No — both return the same not-found response. This is a **deliberate parallel** to the depth-bound trade-off we otherwise reject: for depth, `NOT_FOUND_WITHIN_DEPTH` vs `NOT_CONNECTED` are kept distinct because there’s no privacy reason to hide the difference; for hidden intermediaries, collapsing them is intentional, because confirming “a path exists via someone you can’t see” is itself a disclosure | Privacy requirement (A7/A17) outweighs precision here, unlike the depth case                       | Medium                                                         | Low                                                                                     |
 
-1.  View a business's direct and bounded indirect network.
-2.  Search whether business `A` is connected to business `B`.
-3.  Return a relationship path when policy permits.
-4.  Add a vendor/client and associate it with an existing real-world
-    business when appropriate.
-5.  Resolve multiple source records to one canonical business identity.
-6.  Maintain relationship provenance and directional transaction
-    evidence.
-7.  Merge duplicate canonical identities safely and auditably.
-8.  Support idempotent mutations and recovery from partial external
-    failures.
+**Frozen V1 identity/relationship/authorization/operations invariants:**
 
-## Non-functional requirements
+    IDENTITY
+     1. NetworkBusiness is our provisional network-level canonical identity.
+     2. QBO Vendor/Customer references map to it (typed SourceRecordKey).
+     3. Ambiguous identity matches require confirmation — never silent auto-merge.
+     4. Identity merges are non-destructive (mark SUPERSEDED, never delete).
+     5. Merge history (identity_merge_event) is append-only.
+     6. Merge decisions and provenance are retained for audit and controlled remediation.
+     7. Overlapping merges are serialized (pessimistic lock + canonical
+        root re-resolution at confirmation time).
+     8. Canonical-root state is normalized at merge time; audit trail is not.
+     9. Supersession cycles are prohibited (root-match rejection, not just
+        a direct self-reference CHECK).
 
-- Responsive bounded network queries.
-- High availability for core reads and writes.
-- Correctness before serving-layer optimization.
-- Privacy-safe traversal.
-- Auditable identity decisions and merges.
-- Idempotent mutation semantics.
-- Recoverability from downstream/QBO failures.
-- Measurable datastore evolution rather than technology selection by
-  intuition.
+    RELATIONSHIPS
+    10. Network relationship is undirected because the Craft requirement says so.
+    11. Directional transaction provenance is retained regardless.
+    12. Directional transaction metrics (relationship_direction) are authoritative.
+    13. Undirected metrics (`business_relationship_view`) are derived, never written directly.
+    14. Multiple assertions (USER, TRANSACTION, IMPORT) may establish one logical
+        relationship simultaneously.
+    15. Assertions are retracted (status = RETRACTED), not deleted.
+    16. The derived serving projection is gated on at least one ACTIVE assertion —
+        retraction is not cosmetic.
+    17. Merge consolidation canonicalizes affected assertion endpoints and collapses duplicate logical edges created by the merge without deleting provenance.
+    18. Pending-consolidation reads canonicalize and aggregate duplicate
+        logical edges on the fly (more expensive than post-consolidation reads
+        — the reason consolidation exists at all).
+    19. Every ordinary write to relationship_direction/relationship_assertion
+        resolves business IDs to current canonical form first — this guards
+        against a third-party write racing an in-flight merge, which neither
+        the merge lock nor the consolidation job's version check alone covers.
 
-## Important assumptions
+    AUTHORIZATION
+    20. Authorization participates during traversal expansion, not as a
+        post-hoc filter on a fully resolved response.
+    21. Both endpoints must be visible for an edge to be traversable (A17).
+    22. Hidden nodes cannot be used as invisible traversal intermediaries —
+        and this deliberately reintroduces, for privacy reasons, the same
+        "can't distinguish absence from exclusion" imprecision that depth-
+        bounding otherwise avoids (A19). Confirming a path exists via a
+        business the requester can't see is itself a disclosure.
 
-| ID  | Assumption                                                                                                                      |
-|-----|---------------------------------------------------------------------------------------------------------------------------------|
-| A1  | QBO Vendor and Customer records are role-oriented source records.                                                               |
-| A2  | Unless QBO already exposes a suitable canonical cross-role identifier, Business Network introduces `NetworkBusinessId`.         |
-| A4  | Initial product traversal is bounded to 3 hops and server capped.                                                               |
-| A5  | Relationship path means shortest path by number of hops, not by transaction weight.                                             |
-| A6  | PostgreSQL-only V1 provides authoritative read-your-writes behavior; future projections may be eventually consistent.           |
-| A7  | Authorization is enforced while traversing, not only at the final response.                                                     |
-| A8  | Policy may return `REVEAL`, `TRAVERSE_ONLY`, or `DENY`.                                                                         |
-| A9  | Ambiguous identity resolution requires confirmation; V1 never auto-merges an ambiguous candidate.                               |
-| A10 | Identity resolution is synchronous in the initial flow.                                                                         |
-| A11 | No arbitrary relationship-weight formula is invented. Raw count, amount, and recency evidence are preserved.                    |
-| A12 | Exact relationship provenance types are Product-defined; examples such as `USER`, `TRANSACTION`, and `IMPORT` are illustrative. |
-| A13 | Network-view compute budget is distinct from response-size budget.                                                              |
-| A14 | Point-to-point path search has a separate work budget from network expansion.                                                   |
-| A15 | QBO remains authoritative for raw transaction-level financial data.                                                            |
-| A16 | Business Network consumes transaction changes through a CDC/event contract or equivalent incremental feed; exact QBO integration is to be validated. |
-| A17 | Existing transaction history can be bootstrapped through a bounded batch aggregation rather than copied transaction-by-transaction. |
-| A18 | The incremental feed exposes a stable transaction/event identity, source version, or equivalent offset contract sufficient for replay-safe processing. |
-| A19 | Historical bootstrap and live processing meet at an explicit watermark/cutover position to prevent double counting.              |
+    OPERATIONS
+    23. Merge consolidation is idempotent via an explicit completion check
+        against identity_merge_event, not incidental arithmetic safety.
+    24. Async consolidation jobs revalidate canonical versions and retry on
+        STALE_MERGE_STATE rather than blindly applying.
+    25. Resolution decisions plus bounded top-K candidates are retained.
+    26. Full-network periodic identity reconciliation (resolution drift) is
+        explicitly deferred from V1, reusing the same merge/confirm
+        infrastructure when built.
+    27. Incorrect merges are handled through a controlled administrative
+        reconciliation workflow. Generic automatic merge reversal is outside V1.
 
-If QBO already owns a stable canonical cross-role business identifier,
-the identity layer becomes materially simpler: the network can adopt
-that identifier without changing the graph/query boundaries.
 
-------------------------------------------------------------------------
+**Still genuinely open (not resolved by the above, logged rather than
+silently absent):**
 
-# 3. Scale & Architectural Drivers
-
-Initial scale:
-
-- approximately **1 million businesses**;
-- up to **100 direct relationships per business**;
-- approximately **10 million network searches/month**;
-- highly skewed traffic and degree distribution;
-- undirected network experience with directional transaction evidence.
-
-Average search throughput is modest:
-
-``` text
-10,000,000 / 30 / 24 / 3600 ≈ 3.86 searches/sec
-```
-
-Even a 50× burst is only roughly:
-
-``` text
-≈ 193 searches/sec
-```
-
-Throughput alone therefore does **not** justify graph-specialized
-infrastructure.
-
-Transaction evidence introduces a **separate scaling dimension** from network
-search QPS. The assignment does not provide QBO transaction throughput, so the
-design does not invent one. Raw transactions remain in QBO and Business Network
-stores compact directional aggregates. Evidence storage therefore scales with
-directional business pairs rather than raw transaction count.
-
-``` text
-READ / TRAVERSAL SCALE                 EVIDENCE INGESTION SCALE
-10M searches/month                     potentially very large QBO history
-<=100 direct relationships             continuous transaction changes
-bounded depth <=3                      replay / write-amplification concerns
-
-Primary risk: traversal amplification  Primary risk: ingest + DB write amplification
-```
-
-The more important issue on the read path is **traversal amplification**.
-
-At maximum degree 100, a naive expansion can approach:
-
-``` text
-Depth 1:       100 candidates
-Depth 2:    10,000 candidates
-Depth 3: 1,000,000 candidates
-```
-
-Real graphs contain overlap and cycles, but the architecture cannot
-depend on that.
-
-Therefore:
-
-> **Maximum depth is not a work limit.**
-
-Every query also has explicit limits such as:
-
-``` text
-maxDepth
-maxNodesExplored
-maxEdgesExplored
-timeout
-resultLimit
-pagination
-```
-
-This prevents a high-degree business from turning a nominally
-small-depth query into uncontrolled work.
+- **A12 — relationship source /** **`source_reference`** **semantics**:
+  what identifies the originating record differs by `source_type` and
+  isn’t yet defined; blocks finalizing the relationship-mutation API.
+- **`network_business.status = PENDING_SOURCE`**: resolved provisionally
+  for V1. `POST /businesses/resolve` remains read-only. Only the
+  side-effecting Add Vendor/Client command may create a new
+  `NetworkBusiness` after a `NO_MATCH` result or an explicit **Create
+  New** decision. It creates the identity in `PENDING_SOURCE`,
+  idempotently creates/associates the QBO Vendor/Customer source record,
+  attaches the resulting typed source reference, then transitions to
+  `ACTIVE`. Relationship creation is allowed only after `ACTIVE`.
+  Temporary source failures are retried by a server-owned reconciliation
+  worker; exhausted or abandoned operations transition to
+  `SOURCE_CREATION_FAILED` rather than leaving an orphan pending
+  forever.
+- **Resolution drift**: covered by invariant 26 as a deferral, not a
+  fix.
 
 ------------------------------------------------------------------------
 
-# 4. V1 High-Level Architecture
+## 4. Functional Requirements
 
+**FR1 — View business network** `GET /businesses/{id}/network?depth=N` —
+direct + bounded multi-hop relationships, server-capped depth (reject,
+don’t silently clamp, out-of-range requests), authorization-filtered,
+ranked and paginated for UI consumption. Traversal is additionally bounded by
+`maxExploredNodes`, `maxExploredEdges`, and timeout; response size is bounded
+separately by `maxReturnedNodes`, `maxReturnedEdges`, and page size.
 
-### ASCII architecture — interview / quick-view version
+**FR2 — Search relationship** `GET /relationships/path?from=A&to=B` —
+shortest path by **hop count**. Weight represents relationship
+*strength*, not traversal *cost*; using transaction amount as edge cost
+is semantically undefined (a ₹10M edge could mean “closer” or “further”
+with no basis to choose). If no path is found within the search’s depth
+budget, the response is `NOT_FOUND_WITHIN_DEPTH` (searched-but-bounded),
+never `NOT_CONNECTED` (a stronger claim than what was proven).
 
-The Mermaid diagram below is useful when rendered by GitHub, but this ASCII version is intentionally kept alongside it for easier review and interview discussion.
+**FR3 — Add vendor/client relationship** Add a business as a
+vendor/client, resolving identity before creating the relationship (see
+FR4).
 
-```text
-                                      QUICKBOOKS UI
-                                           |
-                                           v
-                                  +-------------------+
-                                  |    API Gateway    |
-                                  | AuthN / Rate Limit|
-                                  | Trusted Principal |
-                                  +---------+---------+
-                                            |
-                         +------------------+------------------+
-                         |                                     |
-                       READ                                  WRITE
-                         |                                     |
-                         v                                     v
-              +----------------------+              +----------------------+
-              |    Network Query     |              | Relationship Command |
-              |----------------------|              |----------------------|
-              | View Network         |              | Add Vendor / Client  |
-              | Search Path          |              | Add / Retract Edge   |
-              | Bounded BFS          |              | Idempotency / AuthZ  |
-              +----------+-----------+              +----------+-----------+
-                         |                                     |
-                         |                              identity unknown
-                         |                                     |
-                         |                                     v
-                         |                         +------------------------+
-                         |                         |  Identity Resolution   |
-                         |                         |------------------------|
-                         |                         | Normalize descriptor   |
-                         |                         | Candidate retrieval    |
-                         |                         | Deterministic signals  |
-                         |                         +-----+-------------+----+
-                         |                               |             |
-                         |                    candidates |             | possible
-                         |                               |             | duplicate
-                         |                               v             v
-                         |                    +----------------+  +------------------+
-                         |                    | AI / ML        |  | Duplicate        |
-                         |                    | Candidate      |  | Evaluation       |
-                         |                    | Ranker         |  | existing NB IDs  |
-                         |                    +-------+--------+  +--------+---------+
-                         |                            |                    |
-                         |             +--------------+--------------+     |
-                         |             |              |              |     |
-                         |             v              v              v     |
-                         |           MATCH        NO_MATCH       CONFIRM   |
-                         |             |              |          REQUIRED  |
-                         |             |              |              |     |
-                         |             |              |              v     |
-                         |             |              |        Human Decision
-                         |             |              |         /          \
-                         |             |              |  Use Existing   Create New
-                         |             |              |       |             |
-                         |             v              v       v             v
-                         |        +-------------+   +--------------------------+
-                         |        | Reuse       |   | Create NetworkBusiness   |
-                         |        | Existing NB |   | PENDING_SOURCE           |
-                         |        +------+------+   +-------------+------------+
-                         |               |                        |
-                         |               |                        | create / associate
-                         |               |                        v
-                         |               |              +----------------------+
-                         |               |              | QBO Vendor / Customer|
-                         |               |              | SOURCE OF TRUTH      |
-                         |               |              +----+-------------+---+
-                         |               |                   |             |
-                         |               |                success        failure
-                         |               |                   |             |
-                         |               +---------+---------+             |
-                         |                         |                       |
-                         |                         v                       v
-                         |              +----------------------+   Durable Add Operation
-                         |              | Relationship Command |   SOURCE_PENDING
-                         |              | continues            |          |
-                         |              | canonicalize / AuthZ |          v
-                         |              | create assertion     |   Source Association
-                         |              +----------+-----------+   Retry Worker
-                         |                         |                       |
-                         |                         |                       +----> QBO
-                         |                         |
-                         +-------------------------+-----------------------+
-                                                   |
-                                                   v
-                    +----------------------------------------------------------------+
-                    |                 POSTGRESQL — AUTHORITATIVE                     |
-                    |----------------------------------------------------------------|
-                    | NetworkBusiness              source_business_ref               |
-                    | network_business_access      identity_resolution               |
-                    | resolution_candidates        business_add_operation            |
-                    | relationship_assertion       relationship_direction            |
-                    | business_relationship_view   identity_merge_event              |
-                    | merge snapshots              outbox_event                      |
-                    +-------------+----------------------+---------------------------+
-                                  |                      ^
-                                  |                      |
-                         MERGE_REQUESTED                 |
-                                  |                      |
-                                  v                      |
-                         +----------------+              |
-                         | outbox_event   |              |
-                         | PENDING        |              |
-                         +-------+--------+              |
-                                 |                       |
-                         atomic claim                    |
-                   PENDING -> PROCESSING                 |
-                                 |                       |
-                                 v                       |
-                      +----------------------+           |
-                      | Merge Consolidator   |-----------+
-                      |----------------------|
-                      | Move mappings        |
-                      | Canonicalize edges   |
-                      | Combine evidence     |
-                      | Collapse duplicates  |
-                      | Version / fencing    |
-                      +----------------------+
+**FR4 — Business identity resolution** Given a Vendor/Customer
+descriptor, determine whether it represents an existing
+`NetworkBusiness` or requires creating a new one. Ambiguous matches
+require user confirmation (A9); resolution-service unavailability fails
+**closed** (no speculative business creation), not open.
 
-DUPLICATE / MERGE PATH
-----------------------
+### FR4a — New-business creation sequence (provisional V1)
 
-Identity Resolution
-       |
-       +---- two existing NetworkBusinessIds may represent same real business
-       |
-       v
-Duplicate Evaluation
-       |
-       | confirmed according to evidence / policy
-       v
-Merge Workflow
-       |
-       | SAME PostgreSQL transaction:
-       |   1. mark source SUPERSEDED
-       |   2. set canonical_business_id
-       |   3. write identity_merge_event + snapshots
-       |   4. insert MERGE_REQUESTED into outbox_event
-       v
-PostgreSQL
-       |
-       v
-outbox_event: PENDING
-       |
-       | SELECT ... FOR UPDATE SKIP LOCKED
-       | + UPDATE status = PROCESSING
-       | + COMMIT claim transaction
-       v
-Merge Consolidator
-       |
-       +---- mappings
-       +---- relationship assertions
-       +---- directional evidence
-       +---- duplicate logical edges
-       |
-       v
-PostgreSQL
-       |
-       +---- outbox_event = COMPLETED
-       +---- CONSOLIDATION_COMPLETED business-level guard
+`POST /businesses/resolve` is **read-only**: it returns `MATCH`,
+`NO_MATCH`, or `CONFIRM_REQUIRED` and never creates a `NetworkBusiness`.
+The side-effecting sequence below belongs to
+`POST /businesses/{ownerBusinessId}/vendors` after that command obtains
+a `NO_MATCH` resolution result (or after the user explicitly chooses
+**Create New**).
 
-
-TRANSACTION EVIDENCE PATH
--------------------------
-
-QBO Raw Transactions
-        |
-        +---------------------------+
-        |                           |
-        v                           v
-Historical Bootstrap        CDC / Event Stream
-batch aggregate             Kafka/equivalent
-        |                           |
-        |                           v
-        |                 Transaction Evidence
-        |                 Processor
-        |                           |
-        +-------------+-------------+
-                      |
-              aggregate UPSERT
-                      |
-                      v
-            relationship_direction
-                      |
-                      v
-                 PostgreSQL
-
-
-AUTHORIZATION SYNC
-------------------
-
-QBO Identity / Entitlements
-      SOURCE OF TRUTH
-              |
-     +--------+---------+
-     |        |         |
-     v        v         v
- Snapshot   Events   Reconcile
-     |        |         |
-     +--------+---------+
-              |
-              v
-     Authorization Sync
-              |
-      QBO company -> NB ID
-      role -> permission
-              |
-              v
- network_business_access
-              |
-              v
-          PostgreSQL
+``` text
+POST /businesses/{ownerBusinessId}/vendors  [Idempotency-Key]
+      │
+      ├─ resolve descriptor (read-only)
+      │
+      ├─ MATCH / confirmed existing ───────────────► use ACTIVE NetworkBusiness
+      │
+      └─ NO_MATCH / user chose Create New
+                    │
+                    ▼
+          Create NetworkBusiness(status=PENDING_SOURCE)
+                    │
+                    ▼
+          Idempotently create/associate QBO Vendor/Customer source record
+                    │
+                 ┌──┴──┐
+               success failure/timeout
+                 │       │
+                 ▼       ▼
+          Attach typed   Remain PENDING_SOURCE;
+          source ref     server-owned background retry
+                         │
+                         └─ retries exhausted/abandoned
+                            → SOURCE_CREATION_FAILED
+                 │
+                 ▼
+          NetworkBusiness(status=ACTIVE)
+                 │
+                 ▼
+          Create relationship assertion
 ```
+
+V1 does **not** create a relationship to a `PENDING_SOURCE` identity.
+The Add Vendor command is itself idempotent, so a client retry resumes
+the same operation rather than creating another `NetworkBusiness` or QBO
+source record.
+
+**Orphan lifecycle:** `PENDING_SOURCE` is not allowed to live forever
+silently. A background reconciliation worker retries source association
+according to a configurable retry policy. If the operation exhausts that
+policy or is abandoned, the identity is marked `SOURCE_CREATION_FAILED`
+(retained for audit, not deleted); a later explicit retry can resume it.
+The exact retry/retention duration is operational configuration, not a
+product assumption.
+
+**FR5 — Maintain relationship weight** Preserve `transactionCount`,
+`transactionAmount`, `lastTransactionAt` per directional evidence pair;
+derive undirected serving weight from these. No invented scoring formula
+in V1 (A11).
+
+**Explicitly deferred (not V1 scope):** unbounded graph traversal,
+GraphRAG, recommendation/community-detection features (the
+*architecture* isn’t incapable of these — they’re simply not built,
+precomputed, or exposed), fraud detection, supply-chain simulation,
+general-purpose conversational agent, real-time analytics platform.
+
+------------------------------------------------------------------------
+
+## 5. Non-Functional Requirements
+
+Rather than a flat priority ranking, NFRs are grouped by failure class,
+because they aren’t comparable on one axis:
+
+| Class            | Requirement                                                       | Failure if violated                                          |
+|:-----------------|:------------------------------------------------------------------|:-------------------------------------------------------------|
+| **Correctness**  | No unsafe identity merge; no unauthorized relationship disclosure | Corrupted business graph; leaked financial relationship data |
+| **Functional**   | Useful bounded network exploration; relationship/path search      | Feature doesn’t do what was asked                            |
+| **Quality**      | Responsive; available                                             | Degraded UX                                                  |
+| **Optimization** | Hot-node handling                                                 | Slow UX under skew, but not incorrect                        |
+
+Entity-resolution safety (AI-assisted matching) sits inside the
+**Correctness** class, not as a separate low-priority feature — a false
+merge is a correctness failure, not a quality one.
+
+**Availability** — target is “high, particularly for network
+exploration/search”; exact SLOs are derived after the
+datastore/failure-domain decision (Section 9), not invented up front.
+
+**Latency** — provisional, falsifiable *engineering targets* (not Intuit
+requirements), scoped to a defined work budget (see Section 9.4):
+
+| Operation                 | Provisional P95 target |
+|:--------------------------|:-----------------------|
+| Direct neighborhood       | ≤ 100 ms               |
+| 2-hop bounded network     | ≤ 250 ms               |
+| 3-hop bounded network     | ≤ 500 ms               |
+| Bounded shortest-hop path | ≤ 750 ms               |
+
+These targets apply only under a defined traversal-depth + explored-node
+budget + authorization-filtering cost — not to arbitrary unbounded
+queries.
+
+**Consistency** — freshness semantics remain open pending A6, but this
+is a **Medium pivot under PostgreSQL-only V1**, not an architecture
+blocker: the single authoritative store can provide read-your-writes
+when required. A6 becomes a High pivot only if a separate Neo4j/other
+serving projection is introduced (Sections 9 and 11).
+
+**Durability** — confirmed mutations are durable before ACK.
+
+**Security** — authorization is evaluated server-side, *during*
+traversal (filtering candidate nodes/edges before they’re expanded
+further), never as a post-hoc UI-side filter on a fully-resolved
+response.
+
+------------------------------------------------------------------------
+
+## 6. Scale Estimates
+
+    Businesses:                    1,000,000
+    Max direct relationships:      100 / business
+    Max relationship references:   1,000,000 × 100 = 100,000,000
+    Undirected → unique edges:     ≤ 50,000,000
+
+    Monthly searches:               10,000,000
+    Daily:                          ≈ 333,333
+    Average QPS:                    ≈ 3.86
+    20× illustrative stress:        ≈ 77 QPS
+    50× illustrative stress:        ≈ 193 QPS
+
+**Key finding:** aggregate throughput is not the dominant scaling
+challenge. The prompt does not provide a peak multiplier; 20× and 50×
+above are illustrative stress scenarios, not claimed production peaks.
+Even the 50× scenario stays under 200 QPS, so datastore selection should
+not be driven by an invented peak-throughput requirement. The stated
+traffic skew means the real risk is **hot nodes and expensive multi-hop
+traversal**, not raw volume. This finding directly shapes the datastore
+decision in Section 9: neither Neo4j nor Redis is justified by
+throughput; if justified, it’s by query *semantics*.
+
+**Traversal explosion** (why “bounded to 3 hops” ≠ “return everything
+within 3 hops”): at max degree 100, naive depth-1/2/3 expansion is 100 /
+~10,000 / ~1,000,000. Real-graph overlap *might* reduce this, but the
+architecture cannot assume it — a distributor with 100 genuinely
+unrelated vendors, each with 100 unrelated customers, produces
+near-worst-case fan-out with no overlap. Explicit work limits are required independent of graph topology. Crucially,
+**traversal/compute budgets are separate from response/UX budgets** — limiting
+what we return does not protect the datastore if we still explore the entire
+3-hop graph first.
+
+    TRAVERSAL / COMPUTE BUDGET
+    maxDepth           = server-capped (provisional default <= 3)
+    maxExploredNodes   = explicit benchmarked limit
+    maxExploredEdges   = explicit benchmarked limit
+    timeout            = operation-specific latency/work budget
+
+    RESPONSE / UX BUDGET
+    maxReturnedNodes   = explicit UI/result cap
+    maxReturnedEdges   = explicit UI/result cap
+    pageSize           = bounded
+    ranking            = strongest/most relevant first
+
+The exact numeric limits are deliberately not invented here; A13/A14 leave
+them to UX requirements and benchmark results. The invariant is that traversal
+stops as soon as any compute budget is exhausted, then returns only the ranked,
+capped page of results with truncation/budget metadata. We never explore all
+~1M depth-3 candidates and only afterward trim the response to 500 nodes.
+
+------------------------------------------------------------------------
+
+## 7. Business Identity Model
+
+### 7.1 Ownership boundary
+
+QuickBooks exposes **role-oriented** records (Vendor, Customer) — there
+is no evidence of a single canonical cross-role Business entity (A1).
+The Business Network therefore introduces its own identity layer:
+
+    QUICKBOOKS SOURCE RECORDS                    BUSINESS NETWORK
+
+      Vendor V-17 "ABC Ltd"     ─┐
+                                 ├──► Entity Resolution ──► NetworkBusiness NB-42
+      Customer C-91 "ABC Ltd"   ─┘
+
+    QuickBooks owns: source records, their attributes, transactions.
+    Business Network owns: identity unification, source mappings,
+                            merge/audit history, relationship graph.
+
+This is a **provisional assumption** (A2), explicitly banner-flagged: if
+Intuit confirms a canonical cross-role Business ID already exists, the
+identity-unification layer simplifies substantially — the rest of the
+graph model (which operates on `NetworkBusinessId` regardless of who
+issued it) does not need to change.
+
+### 7.2 Source references are typed, not opaque
+
+    SourceRecordKey {
+        sourceSystem      // e.g. QBO
+        sourceEntityType   // VENDOR | CUSTOMER
+        sourceEntityId
+    }
+
+### 7.3 Directional reality vs. undirected requirement
+
+The underlying business relationship is naturally directional (A sells
+to B). The assignment explicitly requires an **undirected**, weighted
+network view. V1 satisfies the stated requirement while preserving the
+directional evidence needed to evolve toward directional modeling later
+(Section 8.3) — the undirected view is a *derived projection* of
+directional evidence, not the source of truth for it.
+
+------------------------------------------------------------------------
+
+## 8. Physical Data Model (PostgreSQL)
+
+### 8.1 Identity
+
+``` sql
+network_business
+────────────────────────────────────────────
+network_business_id      UUID / BIGINT PK
+display_name
+status                    ACTIVE | PENDING_SOURCE | SOURCE_CREATION_FAILED | SUPERSEDED
+canonical_business_id     FK -> network_business, NULL
+created_at / updated_at / version
+
+CHECK (network_business_id <> canonical_business_id)   -- direct self-cycle guard
+-- A→B→A cycles require application-level cycle detection (see 8.4)
+
+
+source_business_ref
+────────────────────────────────────────────
+source_system             -- QBO
+source_entity_type        -- VENDOR | CUSTOMER
+source_entity_id
+network_business_id       FK
+source_display_name
+created_at / updated_at
+
+PK (source_system, source_entity_type, source_entity_id)
+INDEX (network_business_id)
+
+
+network_business_access
+────────────────────────────────────────────
+principal_id               -- likely a QBO company/tenant, not an individual; unresolved
+network_business_id
+permission                 VIEW | MANAGE | ADMIN
+
+PK (principal_id, network_business_id)
+INDEX (network_business_id, principal_id)
+
+
+business_add_operation
+────────────────────────────────────────────
+operation_id               PK
+idempotency_key            UNIQUE
+owner_business_id          FK -> network_business
+network_business_id       nullable FK -> network_business
+resolution_id              nullable FK -> identity_resolution
+state                      RESOLVING | AWAITING_CONFIRMATION
+                           | SOURCE_PENDING | SOURCE_CREATED
+                           | RELATIONSHIP_CREATED | FAILED
+last_error_code            nullable
+created_at / updated_at
+
+-- Stable orchestration record for Add Vendor retries/resume.
+-- AWAITING_CONFIRMATION means resolution returned ambiguous candidates and
+-- the workflow is intentionally paused until the user selects Use Existing
+-- or Create New. Reusing the same Idempotency-Key resumes this operation.
+```
+
+### 8.2 Identity resolution (with top-K candidate retention)
+
+``` sql
+identity_resolution
+────────────────────────────────────────────
+resolution_id PK
+input_descriptor JSONB
+decision                  MATCH | NO_MATCH | CONFIRM_REQUIRED
+selected_business_id
+method
+actor_id
+created_at
+
+
+identity_resolution_candidate
+────────────────────────────────────────────
+resolution_id FK
+candidate_business_id
+rank
+score
+evidence JSONB
+selected BOOLEAN
+
+PK (resolution_id, candidate_business_id)
+```
+
+Top-K only (not the full candidate universe) — enough for false-merge
+forensics and model evaluation without unbounded storage growth.
+
+### 8.3 Relationships — assertion, evidence, and derived serving state kept separate
+
+``` sql
+-- WHO/WHAT established that a relationship exists at all.
+-- Multiple sources may independently assert the same logical relationship
+-- (e.g. a USER assertion and a TRANSACTION-derived assertion for the same
+-- pair) — the relationship stays logically active while at least one
+-- ACTIVE assertion supports it.
+relationship_assertion
+────────────────────────────────────────────
+relationship_id PK
+business_low_id
+business_high_id
+source_type                USER | TRANSACTION | IMPORT
+source_reference           -- identifies the originating source record:
+                            -- meaning depends on source_type and is an
+                            -- OPEN QUESTION tied to A12 (e.g. a batch/
+                            -- aggregation-window id for TRANSACTION, an
+                            -- import-job id for IMPORT, the assertion's
+                            -- own id for USER)
+status                      ACTIVE | RETRACTED
+created_by
+created_at
+retracted_by                nullable
+retracted_at                nullable
+
+UNIQUE (business_low_id, business_high_id, source_type, source_reference)
+-- Retracted assertions are never deleted — provenance matters.
+
+
+-- Directional, transaction-derived evidence — AUTHORITATIVE for these metrics
+relationship_direction
+────────────────────────────────────────────
+seller_business_id
+buyer_business_id
+transaction_count
+transaction_amount
+last_transaction_at
+version
+
+PK (seller_business_id, buyer_business_id)
+
+-- SCALE / INGESTION CONTRACT:
+-- QBO remains the transaction-level system of record. Business Network does
+-- not copy or scan raw QBO transaction history on the graph read path.
+--
+-- Bootstrap:
+--   historical QBO transactions -> bounded batch aggregation
+--   -> one aggregate per directional (seller,buyer) pair.
+--
+-- Continuous:
+--   QBO transaction changes -> CDC/event stream -> Transaction Evidence
+--   Processor -> idempotent incremental/batched UPSERT here.
+--
+-- The processor resolves canonical NetworkBusinessIds, validates input,
+-- deduplicates redeliveries using a stable source event/transaction identity
+-- (or equivalent offset/version contract), and may pre-aggregate a short
+-- window before writing to reduce PostgreSQL write amplification.
+--
+-- Historical bootstrap and live consumption meet at an explicit
+-- watermark/cutover position so a transaction is not counted twice.
+-- Exact source event contract, throughput, retention and partition count
+-- remain integration/capacity-planning details to confirm with QBO.
+
+
+-- V1 DERIVED serving view — never independently written.
+-- Edge existence comes from ACTIVE assertions; transaction evidence is optional.
+-- This allows a freshly added USER relationship to appear before any transaction exists.
+CREATE VIEW business_relationship_view AS
+WITH active_edges AS (
+    SELECT DISTINCT business_low_id, business_high_id
+    FROM relationship_assertion
+    WHERE status = 'ACTIVE'
+),
+direction_totals AS (
+    SELECT
+        LEAST(seller_business_id, buyer_business_id)    AS business_low_id,
+        GREATEST(seller_business_id, buyer_business_id) AS business_high_id,
+        SUM(transaction_amount) AS volume_amount,
+        SUM(transaction_count)  AS transaction_count,
+        MAX(last_transaction_at) AS last_transaction_at
+    FROM relationship_direction
+    GROUP BY 1, 2
+)
+SELECT
+    e.business_low_id,
+    e.business_high_id,
+    COALESCE(d.volume_amount, 0)     AS volume_amount,
+    COALESCE(d.transaction_count, 0) AS transaction_count,
+    d.last_transaction_at
+FROM active_edges e
+LEFT JOIN direction_totals d
+  ON d.business_low_id = e.business_low_id
+ AND d.business_high_id = e.business_high_id;
+
+-- No persisted `weight` formula in V1. The service layer applies:
+-- WeightStrategy(volume_amount, transaction_count, last_transaction_at)
+-- only after Product defines the business semantics of "weight" (A11).
+-- If benchmarking requires materialization, evolve to
+-- business_relationship_projection with PK(low_id, high_id), version, updated_at.
+```
+
+**A11 weight caveat:** `weight` is a logical serving/API field, not a
+committed formula. V1 preserves `transaction_count`,
+`transaction_amount`, and `last_transaction_at`; a service-layer
+`WeightStrategy` derives `weight` only after Product defines what
+“weighted by transaction volume” means. Until then, the raw aggregates
+are authoritative and no scoring formula is invented.
+
+**Transaction evidence scale boundary:** raw QBO transactions are not a
+Business Network serving table and are never scanned by a network read.
+`relationship_direction` is a compact derived aggregate whose row cardinality
+tracks directional business pairs rather than raw transaction count. The
+ingestion path must be replay-safe: redelivery cannot double-increment amount
+or count, and bootstrap/live cutover must have an explicit watermark. This
+keeps graph serving independent of QBO transaction-history size while
+preserving QBO as the source of truth.
+
+**Invariant: no API writes the undirected serving relationship
+directly.** V1 exposes `business_relationship_view`, derived from
+`relationship_direction` and ACTIVE assertions. If read benchmarks
+require materialization, it evolves to
+`business_relationship_projection`; only the projection maintainer
+writes that table.
+
+**Invariant: the derivation is gated by active assertions, not just by
+the presence of directional evidence.** `business_relationship_view`
+only surfaces a pair (A, B) when at least one `relationship_assertion`
+for that pair has `status = ACTIVE`. If all supporting assertions are
+retracted, the pair drops out of the serving projection even if
+`relationship_direction` still holds historical transaction totals —
+otherwise retraction is cosmetic and stale relationships keep appearing
+in network views.
+
+### 8.4 Merge & consolidation (workflow state separated from audit log)
+
+``` sql
+-- Append-only audit log — never rewritten
+identity_merge_event
+────────────────────────────────────────────
+event_id PK
+merge_operation_id
+source_business_id
+target_business_id
+event_type       MERGE_PROPOSED | MERGE_CONFIRMED | CONSOLIDATION_STARTED
+                | CONSOLIDATION_COMPLETED
+actor_id
+reason
+metadata JSONB
+created_at
+
+
+**Merge workflow (synchronous transaction + async consolidation):**
+
+    Confirm merge NB42 → NB88
+            │  (single DB transaction)
+            ├─ 1. SELECT ... FROM network_business WHERE id IN (NB42, NB88)
+            │       ORDER BY id FOR UPDATE   -- deterministic lock order,
+            │                                -- prevents deadlock; re-resolve
+            │                                -- canonical roots after locking
+            ├─ 2. Validate: roots distinct, no cycle, neither identity mid-merge
+            ├─ 3. Record immutable identity_merge_event (MERGE_CONFIRMED)
+            ├─ 4. network_business: NB42.status = SUPERSEDED,
+            │       NB42.canonical_business_id = NB88
+            └─ 5. Write MERGE_REQUESTED outbox_event event
+            COMMIT
+            │
+            ▼
+    Merge Consolidator (async; checks identity_merge_event for an existing
+                        CONSOLIDATION_COMPLETED for this merge_operation_id
+                        before acting — the actual idempotency guard, not
+                        just "the arithmetic happens not to double-count")
+            ├─ move source mappings (source_business_ref)
+            ├─ rewrite/canonicalize affected relationship_assertion endpoints;
+            │     on a uniqueness collision, keep the earlier-created assertion
+            │     ACTIVE and mark the later-created assertion RETRACTED with
+            │     reason = MERGE_DUPLICATE; never delete either row
+            ├─ consolidate directional aggregates (relationship_direction),
+            │     carrying expected_source_version / expected_target_version;
+            │     STALE_MERGE_STATE on mismatch → re-resolve canonical roots,
+            │     retry against current state
+            ├─ collapse duplicate logical edges created by the merge
+            ├─ commit base-table changes; the V1 business_relationship_view
+            │     automatically reflects the committed relationship_assertion
+            │     and relationship_direction state — there are no stored view
+            │     rows to rebuild
+            ├─ FUTURE ONLY: if business_relationship_projection is materialized,
+            │     rebuild/update the affected projection rows
+            └─ mark merge APPLIED (CONSOLIDATION_COMPLETED)
+
+**Locking summary — two different problems, two different mechanisms:**
+
+- **Overlapping merges sharing an identity** → pessimistic locking
+  (`FOR UPDATE`, deterministic ID order) at merge-confirmation time,
+  plus canonical-root re-resolution after the lock is acquired.
+- **Async consolidation racing a later merge** → optimistic version
+  validation (`expected_*_version`) on every consolidation step, retried
+  against re-resolved canonical state on conflict.
+- **Duplicate delivery of the same merge job** → idempotency via
+  checking `identity_merge_event` for prior completion, not via the
+  arithmetic being coincidentally safe to repeat.
+
+**Write-path canonicalization (invariant, not optional):** every
+ordinary write to `relationship_direction` or `relationship_assertion` —
+not just merge/consolidation logic — first resolves its business IDs to
+current canonical form. This is the guard against a third actor: an
+unrelated write targeting NB42 after it’s `SUPERSEDED` but before (or
+during) consolidation, which neither the merge-confirmation lock nor the
+consolidation job’s version check would otherwise catch. In practice
+this means the merge- confirmation transaction’s lock on
+`network_business` rows also blocks concurrent writers from resolving
+through the superseded identity until the merge transaction commits — a
+normal write handler’s canonicalization step will simply see the updated
+`canonical_business_id` and proceed correctly.
+
+**Chain normalization** happens at merge-confirmation time against
+*current canonical state* (NB1→NB2, then NB2→NB3 updates both NB1 and
+NB2’s pointers to NB3), while the audit log keeps the original,
+unmodified chain of events. Before accepting a new merge, both source
+and target canonical roots are resolved and a resolved-root match is
+rejected (prevents A→B→A cycles that a simple self-reference CHECK
+cannot catch).
+
+**Read-time behavior during the (short) consolidation window:** reads
+canonicalize endpoint IDs and `GROUP BY` the canonicalized pair, summing
+matching directional evidence on the fly (e.g. NB42↔NB57 ₹3M + NB88↔NB57
+₹7M → a single logical NB88↔NB57 ₹10M result) rather than guaranteeing
+single-row correctness instantly. This is more expensive than the post-
+consolidation indexed lookup — which is exactly why consolidation
+exists. If merge-aware recursive traversal proves too complex for V1,
+the fallback is to block/limit network reads for an identity with an
+in-flight consolidation rather than knowingly return a partially-merged
+graph. Correctness over temporary availability.
+
+**Incorrect-merge remediation — controlled, not automatic:**
+
+V1 does not promise generic automatic merge reversal. A merge is non-destructive: the superseded `NetworkBusiness`, immutable merge audit, source mappings, and relationship provenance are retained. If a merge is later found to be incorrect, an administrative reconciliation workflow evaluates current state and applies explicit compensating corrections. This avoids claiming that arbitrary post-merge transactions or later merges can always be safely rolled back.
+
+**Invariant: never delete.** A superseded `NetworkBusiness` is marked,
+not removed, and its merge remains traceable for audit and controlled remediation.
+
+------------------------------------------------------------------------
+
+## 9. Datastore Decision: PostgreSQL vs. Neo4j vs. Hybrid
+
+### 9.1 Why this decision is not driven by scale
+
+Per Section 6, aggregate load is ~4 average QPS; even the deliberately
+illustrative 50× stress scenario is only ~193 QPS. The prompt does not
+state an actual peak QPS, so this does not justify introducing a second
+datastore. The comparison must be argued from **query semantics**, not
+volume.
+
+### 9.2 Option comparison
+
+| Dimension                | PostgreSQL | Neo4j      | PostgreSQL + Neo4j |
+|:-------------------------|:-----------|:-----------|:-------------------|
+| Identity lifecycle       | Excellent  | Good       | Excellent          |
+| Source mappings          | Excellent  | Good       | Excellent          |
+| Merge/audit workflow     | Excellent  | Good       | Excellent          |
+| Direct relationships     | Excellent  | Excellent  | Excellent          |
+| Bounded 2-hop            | Good       | Excellent  | Excellent          |
+| Repeated multi-hop       | Fair/Good  | Excellent  | Excellent          |
+| Shortest path            | Fair       | Excellent  | Excellent          |
+| Transactional simplicity | Excellent  | Good       | Fair               |
+| Read-after-write         | Simple     | Simple     | Harder             |
+| Operational complexity   | Lowest     | Low/Medium | Highest            |
+| V1 implementation speed  | Best       | Good       | Worst              |
+| Future graph evolution   | Good       | Best       | Best               |
+
+### 9.3 V1 decision: PostgreSQL-only
+
+Given modest scale, and given that identity/source-mapping/merge/audit
+are inherently relational and transactional workloads that Neo4j would
+only handle “well” (not “excellently”), **PostgreSQL-only is the V1
+choice**, reversed from an earlier hybrid lean, unless Intuit confirms
+multi-hop/path exploration is a high-frequency product experience.
+
+> “I wouldn’t introduce Neo4j merely because the domain is a graph. At
+> the stated query volume, PostgreSQL is a reasonable V1 candidate for
+> both identity and relationship storage. I’d validate indexed adjacency
+> and bounded recursive traversal against explicit latency and
+> work-budget targets before introducing a graph serving database. If
+> usage evolves toward deeper path exploration or graph-centric
+> analytics, the relational relationship model remains a clean source
+> for a Neo4j projection.”
+
+**Query shapes:**
+
+``` sql
+-- Direct neighborhood: trivial with indexes on both sides of the edge
+SELECT ... FROM business_relationship_view
+WHERE business_low_id = :id OR business_high_id = :id;
+
+-- 2/3-hop bounded: recursive CTE with explicit depth, visited-set,
+-- authorization predicate, and work budget baked in
+WITH RECURSIVE network AS (
+    -- seed: starting business, depth 0
+    UNION ALL
+    -- expand: join relationships, increment depth, apply authorization,
+    -- stop at max depth / max explored nodes
+)
+...
+```
+
+Shortest-hop path is PostgreSQL’s weakest fit (BFS is not SQL’s natural
+access pattern) but is implementable and not disqualifying at this
+scale.
+
+### 9.4 Making the decision falsifiable
+
+“Comfortable” and “ugly” are banned as acceptance criteria. The decision
+rule:
+
+> **Keep PostgreSQL-only** if it meets defined latency/work-budget
+> targets (Section 5) under representative *and* adversarial topologies,
+> with maintainable traversal SQL and authorization logic. **Introduce
+> Neo4j serving** if bounded multi-hop/path queries materially fail
+> those targets, or required traversal semantics force application-side
+> graph walking or query complexity that cannot be safely bounded,
+> observed, tested, and maintained. One failed pathological *unbounded*
+> query does not by itself justify Neo4j — first ask whether the product
+> should permit that query at all.
+
+**Benchmark contract:** every run records latency *and* work performed
+(depth, explored nodes/edges, result size, authorization-filtering cost
+— per A18, authorization is counted as work, not ignored).
+
+**Synthetic topologies (four required, not uniform-only):**
+
+| Dataset                                                       | Purpose                                                                                       |
+|:--------------------------------------------------------------|:----------------------------------------------------------------------------------------------|
+| Uniform-ish random                                            | Baseline                                                                                      |
+| Degree-100 hub                                                | Maximum specified direct degree                                                               |
+| Low-overlap branching (100×100, deliberately non-overlapping) | Worst-case expansion — defeats the comforting assumption that cycles/overlap save us          |
+| Skewed/hot businesses                                         | Requirement-specific hot-query behavior; also used to empirically justify (or rule out) Redis |
+
+### 9.5 Where Redis fits
+
+**Redis is deliberately not part of the committed V1 production design
+in this version.** This corrects an earlier planning assumption that
+included Redis by default. Cache placement is downstream of
+authoritative-store and query decisions, and the stated aggregate
+throughput does not justify Redis on its own.
+
+The prompt’s explicit traffic-skew signal makes Redis a strong
+*candidate*. The hot-business benchmark is what will justify or rule it
+in. If justified, use it selectively for hot direct/bounded
+neighborhoods, with authorization-sensitive keys, mutation/merge
+invalidation, and TTL as a safety net.
+
+Panel answer: **“Redis is not here because aggregate throughput scares
+me; it is here only if the skew benchmark shows repeated hot-network
+queries measurably benefit from caching. The ~193 QPS figure is only our
+illustrative 50× stress case, not an Intuit-provided peak.”**
+
+------------------------------------------------------------------------
+
+## 10. Production Component HLD
 
 ```mermaid
 flowchart TB
@@ -450,24 +861,24 @@ flowchart TB
     CREATE["Create NetworkBusiness<br/>PENDING_SOURCE"]
 
     DE["Duplicate Evaluation<br/>Existing NetworkBusinessIds<br/>Evidence / policy<br/>Confirmation"]
-    MW["Merge Workflow<br/>Validate roots<br/>Lock identities<br/>Record merge decision"]
+    MW["Merge Workflow<br/>Validate + lock identities<br/>Canonical identity change<br/>Record audit decision"]
 
     QBO["QBO Vendor / Customer Domain<br/>SOURCE OF TRUTH"]
     SUCCESS["SourceRef + ACTIVE"]
     FAILURE["Source creation failed"]
     CONTINUE["Relationship Command continues<br/>Canonicalize IDs<br/>Validate AuthZ<br/>Create Assertion"]
 
-    PG[("PostgreSQL — AUTHORITATIVE<br/><br/>NetworkBusiness · source_business_ref<br/>network_business_access · identity_resolution<br/>resolution_candidates · business_add_operation<br/>relationship_assertion · relationship_direction<br/>business_relationship_view<br/>identity_merge_event · merge snapshots")]
+    PG[("PostgreSQL — AUTHORITATIVE<br/><br/>NetworkBusiness · source_business_ref<br/>network_business_access · identity_resolution<br/>resolution_candidates · business_add_operation<br/>relationship_assertion · relationship_direction<br/>business_relationship_view<br/>identity_merge_event · outbox_event")]
 
-    OUTBOX["PostgreSQL outbox_event<br/>MERGE_REQUESTED<br/>PENDING → PROCESSING → COMPLETED / FAILED"]
+    OUTBOX["Transactional Outbox<br/>MERGE_REQUESTED"]
     ADDOP["Durable Add Operation<br/>SOURCE_PENDING / retry state"]
 
-    MC["Merge Consolidator<br/>PostgreSQL-backed worker<br/>Move mappings<br/>Canonicalize edges<br/>Combine evidence<br/>Collapse duplicates<br/>Version / fencing"]
+    MC["Merge Consolidator<br/>Move source mappings<br/>Canonicalize edges<br/>Consolidate evidence"]
     SR["Source Association Retry Worker<br/>PostgreSQL-backed worker<br/>Retry idempotently<br/>Create / associate Vendor / Customer"]
 
     QTX["QBO Raw Transactions"]
     HB["Historical Bootstrap<br/>Batch aggregate"]
-    CDC["CDC / Event Stream<br/>Kafka/equivalent — production integration"]
+    CDC["Transaction Change Feed<br/>CDC / event stream<br/>Integration mechanism TBD"]
     TEP["Transaction Evidence Processor<br/>Resolve canonical IDs<br/>Validate<br/>Deduplicate / replay<br/>Pre-aggregate<br/>Idempotent processing"]
 
     QAUTH["QBO Identity / Entitlements<br/>AUTHORITATIVE"]
@@ -509,9 +920,9 @@ flowchart TB
     ADDOP --> PG
 
     DE -->|duplicate confirmed| MW
-    MW -->|same DB transaction: canonical merge + outbox_event row| PG
+    MW -->|synchronous transaction: canonical merge + audit + outbox| PG
     PG --> OUTBOX
-    OUTBOX -->|poll / claim with SKIP LOCKED| MC
+    OUTBOX -->|async| MC
     MC -->|idempotent consolidation| PG
 
     PG --> ADDOP
@@ -538,1434 +949,383 @@ flowchart TB
     NQ -.->|hot cache if justified| REDIS
 ```
 
-### Authority boundary
-
-PostgreSQL owns authoritative Business Network state.
-
-Redis, if introduced, is disposable acceleration. A future graph store
-is also a **rebuildable serving projection**, not a second source of
-truth.
-
-This avoids synchronous dual writes and keeps correctness decisions
-inside transactional boundaries.
-
-------------------------------------------------------------------------
-
-# 5. Canonical Business Identity
-
-A source record is not automatically a network identity.
-
-Example:
-
-``` text
-QBO Vendor V-17
-"ABC Ltd"
-       \
-        \
-         -> Entity Resolution -> NetworkBusiness NB-42
-        /
-       /
-QBO Customer C-91
-"ABC Ltd"
-```
-
-Both source records can map to the same real-world business.
-
-## Ownership boundary
-
-**QBO owns**
-
-- vendor/customer source records;
-- source attributes;
-- financial transactions.
-
-**Business Network owns**
-
-- canonical network identity;
-- source-to-canonical mappings;
-- resolution decisions;
-- merge/audit state;
-- relationship topology and serving semantics.
-
-A source record is addressed by:
-
-``` text
-SourceRecordKey =
-    sourceSystem
-  + sourceEntityType
-  + sourceEntityId
-```
-
-The network uses `NetworkBusinessId` for relationship endpoints so
-topology is not fragmented merely because the same business participates
-in multiple QBO roles.
-
-------------------------------------------------------------------------
-
-# 6. AI-Assisted Identity Resolution
-
-AI/ML improves candidate ranking; it does not own identity truth.
-
-``` mermaid
-flowchart LR
-    D["Input descriptor<br/>name • address • phone<br/>email • source IDs"]
-    N["Normalize"]
-    R["Deterministic retrieval<br/>verified IDs first<br/>then fuzzy candidates"]
-    M["ML / Semantic Ranker"]
-    G{"Decision Gate"}
-    MT["MATCH"]
-    NM["NO_MATCH"]
-    CR["CONFIRM_REQUIRED"]
-    H["Human Confirmation"]
-    A["Audit decision +<br/>bounded top-K evidence"]
-
-    D --> N --> R --> M --> G
-    G --> MT
-    G --> NM
-    G --> CR --> H
-    MT --> A
-    NM --> A
-    H --> A
-```
-
-## Resolution strategy
-
-### 1. Normalize
-
-Normalize fields such as:
-
-- business name;
-- address;
-- phone;
-- email/domain;
-- known source identifiers.
-
-### 2. Retrieve candidates
-
-Prefer strong deterministic identifiers first. If those do not resolve
-the identity, retrieve a bounded candidate set using normalized/fuzzy
-attributes.
-
-### 3. Rank
-
-A deterministic, ML, or semantic ranker scores the candidate set.
-
-The ranker is replaceable and versioned. The architecture does not
-depend on a specific model or vendor.
-
-### 4. Decide
-
-``` text
-MATCH
-NO_MATCH
-CONFIRM_REQUIRED
-```
-
-Ambiguous results go to human confirmation.
-
-### 5. Audit
-
-Persist:
-
-- input descriptor;
-- selected candidate;
-- bounded top-K candidates;
-- evidence;
-- score/rank;
-- resolver/model version;
-- actor;
-- timestamp.
-
-## AI quality metrics
-
-- Recall@K
-- suggested-match precision
-- confirmation rate
-- false-merge rate
-- reversal rate
-- quality segmented by input-data quality
-
-If the ranking capability is unavailable, the system fails closed for
-ambiguous cases. Deterministic resolution may continue where evidence is
-sufficient.
-
-------------------------------------------------------------------------
-
-# 7. Core Write & Read Flows
-
-## 7.1 Add Vendor
-
-``` mermaid
-sequenceDiagram
-    participant C as Client
-    participant API as Network API
-    participant IR as Identity Resolution
-    participant PG as PostgreSQL
-    participant QBO as QBO
-    participant W as Retry Worker
-
-    C->>API: POST Add Vendor + Idempotency-Key
-    API->>PG: Create/reload business_add_operation
-    API->>IR: Resolve descriptor
-    IR->>PG: Persist resolution + candidates
-
-    alt confident match
-        IR-->>API: MATCH existing NetworkBusiness
-    else no match
-        IR-->>API: NO_MATCH
-        API->>PG: Create pending NetworkBusiness
-    else ambiguous
-        IR-->>API: CONFIRM_REQUIRED
-        API-->>C: Request confirmation
-    end
-
-    API->>QBO: Create/associate source record
-
-    alt QBO succeeds
-        API->>PG: Activate identity + source mapping
-        API->>PG: Create ACTIVE relationship assertion
-        API-->>C: Success
-    else timeout/transient failure
-        API->>PG: Persist PENDING_SOURCE
-        PG-->>W: Durable retry work
-        W->>QBO: Retry using stable operation
-    end
-```
-
-### Important invariant
-
-> A relationship is not created against an identity that has not reached
-> the required active/source-associated state.
-
-The durable `business_add_operation` lets retries resume rather than
-recreate identity, source records, or relationships.
-
-------------------------------------------------------------------------
-
-## 7.2 Network Read
-
-``` mermaid
-flowchart TD
-    A["Authenticate principal"]
-    B["Resolve requested ID<br/>to current canonical root"]
-    C["Validate depth +<br/>query work budget"]
-    D["Expand adjacency"]
-    E["Authorization decision<br/>REVEAL / TRAVERSE_ONLY / DENY"]
-    F{"Budget remaining?"}
-    G["Rank / cap results"]
-    H["Paginate + truncation metadata"]
-    I["Return response"]
-
-    A --> B --> C --> D --> E --> F
-    F -- yes --> D
-    F -- no / complete --> G --> H --> I
-```
-
-Authorization is part of traversal semantics.
-
-A hidden business cannot simply be discovered internally and filtered at
-the end, because doing so can leak its existence through paths or
-counts.
-
-------------------------------------------------------------------------
-
-------------------------------------------------------------------------
-
-## 7.3 Transaction Evidence Ingestion
-
-QBO remains the system of record for raw financial transactions. Business
-Network does **not** scan QBO transaction history during a graph read and does
-not copy every transaction into its PostgreSQL serving model.
-
-``` mermaid
-flowchart TD
-    QBO["QBO Transactions<br/>system of record"]
-    HIST["Historical Data"]
-    LIVE["New / Changed Transactions"]
-    BATCH["Bounded Batch Aggregation"]
-    STREAM["CDC / Event Stream<br/>Kafka or equivalent"]
-    EP["Transaction Evidence Processor<br/>resolve canonical IDs<br/>validate • dedupe • pre-aggregate"]
-    RD[("relationship_direction<br/>aggregate per directional pair")]
-    VIEW["business_relationship_view"]
-    QS["Network Query Service"]
-
-    QBO --> HIST --> BATCH --> RD
-    QBO --> LIVE --> STREAM --> EP --> RD
-    RD --> VIEW --> QS
-```
-
-Example:
-
-``` text
-T1  NB200 -> NB100  ₹10K
-T2  NB200 -> NB100  ₹20K
-T3  NB200 -> NB100  ₹30K
-            |
-            v
-short-window / batch aggregation
-            |
-            v
-NB200 -> NB100 | count=3 | amount=₹60K
-```
-
-### Scale and correctness properties
-
-- **Horizontal processing:** partition the stream by a stable business/account
-  key so evidence processors can scale horizontally.
-- **Pre-aggregation:** combine changes for the same directional pair before
-  batched PostgreSQL UPSERTs when needed.
-- **Replay safety:** redelivery must not increment count or amount twice; the
-  source needs a stable event/transaction identity, source version, or
-  equivalent offset contract.
-- **Historical bootstrap:** aggregate existing QBO history through a bounded
-  batch path.
-- **Bootstrap/live cutover:** use an explicit watermark/cutover position to
-  prevent double counting.
-- **Failure isolation:** quarantine/reconcile malformed or unresolved evidence
-  rather than corrupting the aggregate.
-
-The exact QBO event contract, throughput, retention, partition count, and
-change semantics are integration/capacity-planning details to validate with
-the QBO transaction domain.
-
-
-# 8. Data Model & ER Diagram
-
-The model separates these core concerns:
-
-1.  canonical business identity;
-2.  source-system mappings;
-3.  access control;
-4.  relationship existence/provenance;
-5.  directional transaction evidence;
-6.  identity-resolution audit;
-7.  durable mutation/orchestration state;
-8.  merge/consolidation history.
-
-Raw QBO transactions are intentionally outside this model. Business Network
-stores only the derived evidence required for network serving.
-
-``` mermaid
-erDiagram
-    NETWORK_BUSINESS ||--o{ SOURCE_BUSINESS_REF : maps
-    NETWORK_BUSINESS ||--o{ NETWORK_BUSINESS_ACCESS : grants
-
-    BUSINESS_ADD_OPERATION }o--o| NETWORK_BUSINESS : creates_or_associates
-    BUSINESS_ADD_OPERATION }o--o| IDENTITY_RESOLUTION : uses
-
-    IDENTITY_RESOLUTION ||--o{ IDENTITY_RESOLUTION_CANDIDATE : ranks
-    NETWORK_BUSINESS ||--o{ IDENTITY_RESOLUTION_CANDIDATE : candidate
-
-    NETWORK_BUSINESS ||--o{ RELATIONSHIP_ASSERTION : endpoint
-    NETWORK_BUSINESS ||--o{ RELATIONSHIP_DIRECTION : seller_or_buyer
-
-    IDENTITY_MERGE_EVENT ||--o{ MERGE_DIRECTION_SNAPSHOT : captures
-    IDENTITY_MERGE_EVENT ||--o{ MERGE_ASSERTION_SNAPSHOT : captures
-
-    NETWORK_BUSINESS {
-        uuid network_business_id PK
-        text display_name
-        text status
-        uuid canonical_business_id FK
-        bigint version
-        timestamp created_at
-        timestamp updated_at
-    }
-
-    SOURCE_BUSINESS_REF {
-        text source_system PK
-        text source_entity_type PK
-        text source_entity_id PK
-        uuid network_business_id FK
-        text source_display_name
-    }
-
-    NETWORK_BUSINESS_ACCESS {
-        text principal_id PK
-        uuid network_business_id PK
-        text permission
-    }
-
-    IDENTITY_RESOLUTION {
-        uuid resolution_id PK
-        jsonb input_descriptor
-        text decision
-        uuid selected_business_id
-        text method
-        text actor_id
-        timestamp created_at
-    }
-
-    IDENTITY_RESOLUTION_CANDIDATE {
-        uuid resolution_id PK
-        uuid candidate_business_id PK
-        int rank
-        decimal score
-        jsonb evidence
-        boolean selected
-    }
-
-    BUSINESS_ADD_OPERATION {
-        uuid operation_id PK
-        text idempotency_key UK
-        uuid owner_business_id
-        uuid network_business_id
-        uuid resolution_id
-        text state
-        text last_error_code
-    }
-
-    RELATIONSHIP_ASSERTION {
-        uuid relationship_id PK
-        uuid business_low_id
-        uuid business_high_id
-        text source_type
-        text source_reference
-        text status
-        timestamp created_at
-    }
-
-    RELATIONSHIP_DIRECTION {
-        uuid seller_business_id PK
-        uuid buyer_business_id PK
-        bigint transaction_count
-        decimal transaction_amount
-        timestamp last_transaction_at
-        bigint version
-    }
-
-    IDENTITY_MERGE_EVENT {
-        uuid event_id PK
-        uuid merge_operation_id
-        uuid source_business_id
-        uuid target_business_id
-        text event_type
-        jsonb metadata
-    }
-```
-
-### Derived serving relationship
-
-`business_relationship_view` is derived from:
-
-``` text
-ACTIVE relationship assertions
-            +
-directional evidence aggregated for the same pair
-            ↓
-undirected relationship serving view
-```
-
-It has no independent lifecycle and is never independently mutated.
-
-------------------------------------------------------------------------
-
-# 9. Physical PostgreSQL Schema
-
-The following is the V1 physical model at design level. Exact PostgreSQL
-DDL belongs with the implementation.
-
-## `network_business`
-
-| Column                  | Type        | Constraint / index | Why it exists                                                                  |
-|-------------------------|-------------|--------------------|--------------------------------------------------------------------------------|
-| `network_business_id`   | UUID/BIGINT | PK                 | Stable canonical network identifier                                            |
-| `display_name`          | TEXT        |                    | Human-readable identity                                                        |
-| `status`                | ENUM/TEXT   | indexed            | `ACTIVE`, `PENDING_SOURCE`, `SOURCE_CREATION_FAILED`, `SUPERSEDED`             |
-| `canonical_business_id` | UUID/BIGINT | nullable self-FK   | Redirects a merged identity to its canonical root; prevents stale identity use |
-| `version`               | BIGINT      |                    | Fencing/version validation for merge/write races                               |
-| `created_at`            | TIMESTAMP   |                    | Audit/operations                                                               |
-| `updated_at`            | TIMESTAMP   |                    | Reconciliation/operations                                                      |
-
-Invariant:
-
-``` text
-canonical_business_id != network_business_id
-```
-
-Canonical-root resolution plus locked merge validation prevents redirect
-cycles.
-
-------------------------------------------------------------------------
-
-## `source_business_ref`
-
-| Column                | Type        | Constraint / index | Why it exists                                    |
-|-----------------------|-------------|--------------------|--------------------------------------------------|
-| `source_system`       | TEXT        | composite PK       | Identifies source namespace                      |
-| `source_entity_type`  | TEXT        | composite PK       | Distinguishes Vendor/Customer/etc.               |
-| `source_entity_id`    | TEXT        | composite PK       | Stable source identifier                         |
-| `network_business_id` | UUID/BIGINT | FK + index         | Maps source record to canonical network identity |
-| `source_display_name` | TEXT        |                    | Resolution/audit context                         |
-| timestamps            | TIMESTAMP   |                    | Reconciliation/audit                             |
-
-This table is the boundary between QBO source identity and network
-identity.
-
-------------------------------------------------------------------------
-
-## `network_business_access`
-
-| Column                | Type        | Constraint / index | Why it exists                          |
-|-----------------------|-------------|--------------------|----------------------------------------|
-| `principal_id`        | TEXT        | composite PK       | Calling user/tenant/principal          |
-| `network_business_id` | UUID/BIGINT | composite PK       | Protected network identity             |
-| `permission`          | TEXT        |                    | Input to centralized policy evaluation |
-
-Policy evaluation converts access data and context into:
-
-``` text
-REVEAL
-TRAVERSE_ONLY
-DENY
-```
-
-------------------------------------------------------------------------
-
-## `business_add_operation`
-
-| Column                | Type        | Constraint / index | Why it exists                           |
-|-----------------------|-------------|--------------------|-----------------------------------------|
-| `operation_id`        | UUID        | PK                 | Stable workflow identity                |
-| `idempotency_key`     | TEXT        | UNIQUE             | Prevents duplicate Add Vendor mutations |
-| `owner_business_id`   | UUID/BIGINT | FK                 | Business initiating the operation       |
-| `network_business_id` | UUID/BIGINT | nullable FK        | Resolved/created identity               |
-| `resolution_id`       | UUID        | nullable FK        | Resolution evidence                     |
-| `state`               | TEXT        | indexed            | Durable workflow progress               |
-| `last_error_code`     | TEXT        |                    | Retry/reconciliation diagnostics        |
-| timestamps            | TIMESTAMP   |                    | Detects stuck operations                |
-
-Representative states:
-
-``` text
-RESOLVING
-AWAITING_CONFIRMATION
-SOURCE_PENDING
-SOURCE_CREATED
-RELATIONSHIP_CREATED
-FAILED
-```
-
-------------------------------------------------------------------------
-
-## `identity_resolution`
-
-| Column                 | Type        | Constraint / index | Why it exists                              |
-|------------------------|-------------|--------------------|--------------------------------------------|
-| `resolution_id`        | UUID        | PK                 | Resolution attempt                         |
-| `input_descriptor`     | JSONB       |                    | Exact input used for decision              |
-| `decision`             | TEXT        |                    | `MATCH`, `NO_MATCH`, `CONFIRM_REQUIRED`    |
-| `selected_business_id` | UUID/BIGINT | nullable FK        | Final selected canonical candidate         |
-| `method`               | TEXT        |                    | Rule/resolver/model version                |
-| `actor_id`             | TEXT        |                    | User/system responsible for final decision |
-| `created_at`           | TIMESTAMP   |                    | Audit                                      |
-
-### `identity_resolution_candidate`
-
-| Column                  | Type        | Constraint / index | Why it exists                 |
-|-------------------------|-------------|--------------------|-------------------------------|
-| `resolution_id`         | UUID        | composite PK       | Parent decision               |
-| `candidate_business_id` | UUID/BIGINT | composite PK       | Candidate identity            |
-| `rank`                  | INT         |                    | Candidate ordering            |
-| `score`                 | DECIMAL     |                    | Ranker output                 |
-| `evidence`              | JSONB       |                    | Explainability/audit evidence |
-| `selected`              | BOOLEAN     |                    | Records chosen candidate      |
-
-Only a bounded top-K candidate set is retained.
-
-------------------------------------------------------------------------
-
-## `relationship_assertion`
-
-| Column             | Type        | Constraint / index | Why it exists                   |
-|--------------------|-------------|--------------------|---------------------------------|
-| `relationship_id`  | UUID        | PK                 | Stable provenance record        |
-| `business_low_id`  | UUID/BIGINT | index              | Canonically ordered endpoint    |
-| `business_high_id` | UUID/BIGINT | index              | Canonically ordered endpoint    |
-| `source_type`      | TEXT        |                    | Relationship provenance         |
-| `source_reference` | TEXT        |                    | Idempotency/audit of provenance |
-| `status`           | TEXT        | index              | `ACTIVE` / `RETRACTED`          |
-| `created_by`       | TEXT        |                    | Audit                           |
-| `created_at`       | TIMESTAMP   |                    | Audit                           |
-| `retracted_by`     | TEXT        | nullable           | Audit                           |
-| `retracted_at`     | TIMESTAMP   | nullable           | Audit                           |
-
-Constraints:
-
-``` text
-business_low_id < business_high_id
-
-UNIQUE (
-    business_low_id,
-    business_high_id,
-    source_type,
-    source_reference
-)
-```
-
-Multiple independent assertions may support the same edge. Retraction of
-one provenance source therefore does not necessarily remove the edge.
-
-------------------------------------------------------------------------
-
-## `relationship_direction`
-
-| Column                | Type        | Constraint / index | Why it exists            |
-|-----------------------|-------------|--------------------|--------------------------|
-| `seller_business_id`  | UUID/BIGINT | composite PK       | Directional endpoint     |
-| `buyer_business_id`   | UUID/BIGINT | composite PK       | Directional endpoint     |
-| `transaction_count`   | BIGINT      |                    | Raw directional evidence |
-| `transaction_amount`  | DECIMAL     |                    | Raw directional evidence |
-| `last_transaction_at` | TIMESTAMP   |                    | Recency evidence         |
-| `version`             | BIGINT      |                    | Merge/write fencing      |
-
-Index the reverse endpoint order as required for aggregation.
-
-One row represents the aggregate for one **directional canonical business
-pair**, not one QBO transaction. For example, 100,000 raw QBO transactions
-between `NB200 -> NB100` can become one `relationship_direction` row containing
-the aggregate count, amount, and latest transaction time.
-
-This is the key scale boundary: graph-serving storage grows with directional
-business relationships rather than raw transaction volume. Replay/deduplication
-state belongs to the evidence-ingestion contract or dedicated processing state;
-redelivery must not double-increment `transaction_count` or
-`transaction_amount`.
-
-### Why topology and transaction evidence are separate
-
-Historical transaction totals must not accidentally keep a relationship
-visible after every relationship assertion has been retracted.
-
-Therefore:
-
-``` text
-edge exists        := at least one ACTIVE assertion
-edge evidence      := directional aggregates
-serving relationship := active edge + available evidence
-```
-
-------------------------------------------------------------------------
-
-# 10. Relationship Semantics & Traversal
-
-The product exposes an **undirected business network**, while financial
-reality may be directional.
-
-Example:
-
-``` text
-A sells to B
-B buys from A
-```
-
-The network can expose:
-
-``` text
-A -------- B
-```
-
-while preserving directional evidence independently:
-
-``` text
-A -> B : count, amount, lastTransactionAt
-B -> A : count, amount, lastTransactionAt
-```
-
-No arbitrary formula such as:
-
-``` text
-weight = amount × count × recency
-```
-
-is introduced until Product defines its meaning.
-
-## Bounded expansion
-
-A network-view query uses a bounded BFS-style expansion:
-
-``` text
-frontier = [start]
-visited  = {start}
-
-for depth in 1..maxDepth:
-    next = []
-
-    for node in frontier:
-        for neighbor in authorizedAdjacency(node):
-            consumeWorkBudget()
-
-            if policy(neighbor) == DENY:
-                continue
-
-            if neighbor not visited:
-                visited.add(neighbor)
-
-                if policy(neighbor) == REVEAL:
-                    addToResults(neighbor)
-
-                if policy(neighbor) allows traversal:
-                    next.add(neighbor)
-
-            if budgetExceeded():
-                return truncatedResult()
-
-    frontier = next
-```
-
-The implementation uses database queries/batches rather than issuing one
-SQL query per node.
-
-## Path search
-
-For unweighted shortest-hop semantics, bounded BFS is appropriate.
-
-A result of:
-
-``` text
-NOT_FOUND_WITHIN_DEPTH
-```
-
-means only that no permitted path was found within the requested and
-server-allowed envelope.
-
-It does **not** prove global disconnection.
-
-------------------------------------------------------------------------
-
-# 11. Identity Merge & Concurrency
-
-Identity merge is one of the highest-risk mutation paths because it
-changes canonical endpoints used by concurrent relationship and
-transaction writes.
-
-Example:
-
-``` text
-NB-42  ----merge---->  NB-88
-
-NB-42.status = SUPERSEDED
-NB-42.canonical_business_id = NB-88
-```
-
-## Merge confirmation
-
-``` mermaid
-flowchart TD
-    A["Request merge NB-42 -> NB-88"]
-    B["Lock identities in deterministic order"]
-    C["Re-resolve canonical roots under lock"]
-    D{"Same root or cycle?"}
-    E["Reject / idempotent completion"]
-    F["Record immutable MERGE_CONFIRMED event"]
-    G["Capture assertion + direction snapshots"]
-    H["Set source SUPERSEDED<br/>canonical -> target<br/>increment fence/version"]
-    I["Write outbox_event merge work"]
-    J["COMMIT"]
-    K["Async Merge Consolidator"]
-    L["Validate expected roots + versions"]
-    M["Move source mappings<br/>canonicalize assertions<br/>consolidate directional facts"]
-    N["Record CONSOLIDATION_COMPLETED"]
-
-    A --> B --> C --> D
-    D -- yes --> E
-    D -- no --> F --> G --> H --> I --> J --> K --> L --> M --> N
-```
-
-## Concurrency strategy
-
-Two complementary techniques are used.
-
-### Pessimistic locking at merge confirmation
-
-The identities involved in the canonical decision are locked in
-deterministic order.
-
-This protects the short, correctness-critical decision boundary.
-
-### Optimistic fencing for ordinary/async writes
-
-Ordinary writers:
-
-1.  resolve the current canonical root;
-2.  use/validate identity version where required;
-3.  canonicalize endpoints before committing.
-
-The asynchronous consolidator validates expected versions/root state
-before applying work.
-
-This avoids holding long locks during potentially large consolidation.
-
-## Reversal
-
-Merge snapshots preserve enough pre-merge state to support controlled
-reversal when it remains unambiguous.
-
-Unsafe reversal is rejected rather than guessed.
-
-------------------------------------------------------------------------
-
 ### V1 asynchronous-work model
 
-`MERGE_REQUESTED` does **not** imply Kafka. In V1, the authoritative merge decision and a `MERGE_REQUESTED` outbox_event row are committed atomically in the same PostgreSQL transaction. A PostgreSQL-backed Merge Consolidator polls/claims pending rows (for example with `FOR UPDATE SKIP LOCKED`), performs idempotent consolidation, and marks the work completed or failed. Kafka or another broker can be introduced later as an outbox_event publication target if throughput or integration fan-out justifies it.
+A confirmed merge commits the canonical identity change, immutable merge audit, and a `MERGE_REQUESTED` transactional-outbox record atomically in PostgreSQL. After commit, the logical identity merge is effective immediately. A background Merge Consolidator then performs idempotent physical consolidation of source mappings, relationship endpoints, and directional evidence. Kafka is not required for merge correctness.
 
-`PENDING_SOURCE` is durable operation state rather than a Kafka event. If QBO Vendor/Customer creation fails or times out, `business_add_operation` / the business status retains the incomplete operation. A Source Association Retry Worker polls eligible operations, retries the QBO association idempotently, and updates the same PostgreSQL state on success.
+`PENDING_SOURCE` is separate durable Add Vendor/Customer operation state. If QBO source association fails or times out, a background retry worker resumes that operation idempotently.
 
-The transaction-evidence path is separate: the production design may consume QBO transaction changes through CDC / an event stream (`Kafka/equivalent`), but that is an integration/evolution path and should not be presented as already implemented in the V1 reference code unless the corresponding producer/consumer exists.
+The transaction-evidence path is also separate. QBO remains authoritative for raw transactions; Business Network consumes a transaction-change feed through an integration contract whose exact mechanism (CDC, event stream, or equivalent) is to be confirmed with the QBO domain.
 
+### Transactional outbox — interview reference
 
-
-
-
-
-### PostgreSQL outbox physical schema
-
-The V1 asynchronous merge path uses a PostgreSQL-backed transactional outbox. The table is named `outbox_event`; Kafka is not required for merge correctness.
-
-```sql
-CREATE TABLE outbox_event (
-    event_id        UUID PRIMARY KEY,
-    event_type      VARCHAR(50) NOT NULL,
-    aggregate_type  VARCHAR(50) NOT NULL,
-    aggregate_id    UUID NOT NULL,
-    payload         JSONB NOT NULL,
-
-    status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-    attempt_count   INT NOT NULL DEFAULT 0,
-
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    available_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    claimed_at      TIMESTAMPTZ NULL,
-    processed_at    TIMESTAMPTZ NULL,
-    last_error      TEXT NULL,
-
-    CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'))
-);
-
-CREATE INDEX idx_outbox_event_pending
-ON outbox_event (event_type, available_at, created_at)
-WHERE status = 'PENDING';
-```
-
-A merge writes the canonical identity change, merge audit/snapshots, and the outbox event in the **same PostgreSQL transaction**:
-
-```sql
-BEGIN;
-
--- lock and validate source/target identities
--- mark source NetworkBusiness as SUPERSEDED
--- set canonical_business_id to the target
--- insert identity_merge_event
--- insert merge snapshots
-
-INSERT INTO outbox_event (
-    event_id,
-    event_type,
-    aggregate_type,
-    aggregate_id,
-    payload,
-    status
-)
-VALUES (
-    :event_id,
-    'MERGE_REQUESTED',
-    'NETWORK_BUSINESS',
-    :source_business_id,
-    :payload::jsonb,
-    'PENDING'
-);
-
-COMMIT;
-```
-
-Example logical row:
-
-| Column | Example |
-|---|---|
-| `event_id` | `E100` |
-| `event_type` | `MERGE_REQUESTED` |
-| `aggregate_type` | `NETWORK_BUSINESS` |
-| `aggregate_id` | `NB450` |
-| `payload` | `{"sourceBusinessId":"NB450","targetBusinessId":"NB200","mergeEventId":"M100"}` |
-| `status` | `PENDING` |
-| `attempt_count` | `0` |
-
-The Merge Consolidator claims pending work from PostgreSQL. Multiple worker instances can safely divide queue work using row locking:
-
-```sql
-BEGIN;
-
--- 1. Lock a bounded set of eligible rows so concurrent workers skip them.
-SELECT event_id
-FROM outbox_event
-WHERE event_type = 'MERGE_REQUESTED'
-  AND status = 'PENDING'
-  AND available_at <= CURRENT_TIMESTAMP
-ORDER BY created_at
-FOR UPDATE SKIP LOCKED
-LIMIT :batch_size;
-
--- 2. In the SAME transaction, durably record ownership before releasing locks.
-UPDATE outbox_event
-SET status = 'PROCESSING',
-    claimed_at = CURRENT_TIMESTAMP,
-    attempt_count = attempt_count + 1
-WHERE event_id = ANY(:claimed_ids);
-
-COMMIT;
-```
-
-Only after this claim transaction commits does the worker perform the potentially longer merge consolidation. This makes `PROCESSING` a real durable state rather than merely a row lock. A later poll cannot claim the same row while it remains `PROCESSING`.
-
-In an implementation, the select-and-update can also be expressed as a single PostgreSQL statement using a CTE with `UPDATE ... RETURNING`; the required invariant is the same: **selection and the transition to `PROCESSING` are atomic before consolidation starts**.
-
-Processing remains idempotent even though claiming prevents normal duplicate delivery. After successful consolidation the worker marks the event `COMPLETED` and sets `processed_at`.
-
-For a retryable failure, the worker must not immediately expose the same row to a tight retry loop. It transitions the row back to `PENDING`, records `last_error`, clears the claim, and moves `available_at` forward using a bounded backoff policy derived from `attempt_count`:
-
-```sql
-UPDATE outbox_event
-SET status = 'PENDING',
-    claimed_at = NULL,
-    last_error = :last_error,
-    available_at = CURRENT_TIMESTAMP + :backoff_interval
-WHERE event_id = :event_id
-  AND status = 'PROCESSING';
-```
-
-Conceptually, `backoff_interval = backoff(attempt_count)`; the exact base delay, multiplier, jitter, and cap are operational configuration rather than hard-coded architecture assumptions.
-
-Retry exhaustion is also explicit configuration. Define a `max_attempts` policy parameter (value TBD from operational requirements). When a failure is classified as permanent, or `attempt_count >= max_attempts`, transition the event to `FAILED` instead of returning it to `PENDING`, and surface it through metrics/alerts and an operator-visible recovery path.
-
-There are deliberately **two layers of idempotency**. The `outbox_event` lifecycle (`PENDING → PROCESSING → COMPLETED`) is the transport/work-queue guard that prevents the same outbox row from being processed repeatedly. The Merge Consolidator's existing `identity_merge_event` / `CONSOLIDATION_COMPLETED` check is a second, business-level guard: if the same `merge_operation_id` is accidentally re-queued in a different outbox row with a new `event_id`, the merge decision is still not consolidated twice.
-
-The ownership distinction is intentional:
+The merge decision and `MERGE_REQUESTED` outbox record are written in the same PostgreSQL transaction. The Merge Consolidator processes committed work asynchronously and idempotently. Worker claiming, retry/backoff, stale-work recovery, and concurrency mechanics are implementation details to discuss only if the interviewer drills into the outbox.
 
 ```text
-MERGE_REQUESTED
-      |
-      v
-outbox_event
-      |
-      v
-Merge Consolidator
-
-PENDING_SOURCE
-      |
-      v
-network_business.status
-+ business_add_operation.state
-      |
-      v
-Source Association Retry Worker
+Merge transaction
+   + canonical identity change
+   + immutable merge audit
+   + MERGE_REQUESTED outbox_event
+            COMMIT
+               |
+               v
+      Merge Consolidator
+               |
+       idempotent physical
+          consolidation
 ```
 
-`MERGE_REQUESTED` represents durable asynchronous work caused by an already committed merge decision. `PENDING_SOURCE` represents an incomplete Add Vendor/Customer operation that must be resumed; it is not a merge outbox event.
+### 10.1 Main read path — View Network
 
-# 12. Reliability & Failure Handling
+1.  Gateway authenticates the request and passes the principal/tenant
+    context.
+2.  Query service resolves the requested ID to its current canonical
+    `NetworkBusinessId`.
+3.  Validate `depth` against the server cap and initialize the traversal
+    work budget.
+4.  Recursive expansion joins `network_business_access` at **every
+    hop**; an edge is expanded only when both endpoints are visible
+    under A17.
+5.  Results are ranked, capped and paginated. During an in-flight merge,
+    endpoints are canonicalized and duplicate logical edges are
+    aggregated.
+6.  If the benchmark justifies Redis, only selected hot direct/bounded
+    neighborhoods are cached; authorization-sensitive cache keys include
+    the relevant visibility scope, and mutations/merges invalidate
+    affected entries with TTL as a safety net.
 
-## Failure-mode-driven design
+### 10.2 Main write path — Add Vendor/Client
 
-| Failure mode                                           | Protection                                                               |
-|--------------------------------------------------------|--------------------------------------------------------------------------|
-| Client retries a mutation                              | `idempotency_key`, stable operation IDs, provenance uniqueness           |
-| QBO fails midway through Add Vendor                    | Durable `business_add_operation`; `PENDING_SOURCE`; retry/reconciliation |
-| Two merges overlap                                     | Deterministic row locks + canonical-root re-resolution                   |
-| Merge would create redirect cycle                      | Same-root/cycle validation under lock                                    |
-| Ordinary write races with merge                        | Resolve canonical root before write + version/fence validation           |
-| Async merge worker operates on stale state             | Expected root/version validation; retry stale work                       |
-| Merge event delivered twice                            | Stable `merge_operation_id` + append-only events + completion check      |
-| Merge must be reversed                                 | Immutable audit + direction/assertion snapshots                          |
-| Historical totals remain after relationship retraction | Serving edge gated by ACTIVE assertions                                  |
-| Redis unavailable                                      | Bypass cache and read authoritative store                                |
-| Future graph projection unavailable                    | Fall back to PostgreSQL authoritative path                               |
-| Identity ranker unavailable                            | Fail closed for ambiguity; deterministic evidence may continue           |
-| Transaction event delivered more than once              | Stable event identity/version/offset + idempotent/deduplicated aggregation |
-| Evidence processor crashes after processing             | Replay from committed stream position without double counting            |
-| PostgreSQL temporarily unavailable for evidence writes  | Durable stream retention + retry/backpressure                            |
-| Evidence consumers fall behind                          | Consumer-lag monitoring + horizontal scaling                             |
-| Historical bootstrap overlaps live stream               | Explicit watermark/cutover position                                      |
-| Transaction change arrives out of order                 | Source version/event-time semantics where required                       |
-| Transaction cannot resolve to canonical business IDs    | Quarantine/DLQ + reconciliation; do not corrupt aggregate                |
+1.  `POST /businesses/{ownerBusinessId}/vendors` starts an idempotent
+    Add Vendor operation and invokes the **read-only** resolver.
+2.  A deterministic/confirmed match yields an existing ACTIVE
+    `NetworkBusinessId`; an ambiguous match pauses for UI confirmation.
+3.  `NO_MATCH` (or explicit **Create New**) follows FR4a: create
+    `PENDING_SOURCE`, idempotently create/associate the source record,
+    attach the typed source reference, then activate.
+4.  If source association fails, a background reconciliation worker
+    retries; exhausted/abandoned operations become
+    `SOURCE_CREATION_FAILED` and remain auditable.
+5.  Once both identities are ACTIVE, the command canonicalizes endpoint
+    IDs, validates authorization and writes a `relationship_assertion`.
+6.  Transaction-derived evidence is maintained off the graph read path.
+    QBO remains authoritative for raw transactions. Historical data is
+    bootstrapped through a bounded batch aggregation; new/changed
+    transactions arrive through a CDC/event stream. A horizontally scalable
+    Transaction Evidence Processor resolves canonical business IDs,
+    validates and deduplicates events, optionally pre-aggregates by
+    `(seller_business_id, buyer_business_id)`, and performs idempotent/batched
+    UPSERTs into `relationship_direction`. A bootstrap/live watermark prevents
+    double counting. The undirected serving view then derives its metrics from
+    this authoritative directional aggregate plus ACTIVE assertions. Exact
+    QBO source-event semantics remain tied to A12.
+7.  Confirmed mutations are committed before ACK.
 
-## Transactional outbox_event
+### 10.2a Timestamped rehearsal — Add at 10:00:00, read at 10:00:01
 
-Authoritative state change and event publication intent are committed
-together.
-
-``` mermaid
-sequenceDiagram
-    participant S as Service
-    participant PG as PostgreSQL
-    participant P as outbox_event Publisher
-    participant D as Downstream Projection/Worker
-
-    S->>PG: BEGIN
-    S->>PG: Write authoritative state
-    S->>PG: Write outbox_event event
-    S->>PG: COMMIT
-    PG-->>S: Success
-
-    P->>PG: Read unpublished outbox_event rows
-    P->>D: Publish idempotently
-    P->>PG: Mark published
-```
-
-This removes the classic failure window:
+Use this as rehearsal material for the panel’s “walk me through it live”
+question.
 
 ``` text
-DB commit succeeds
-        +
-event publish fails
+10:00:00  Browser
+          POST /businesses/{myBusinessId}/vendors
+          Idempotency-Key: op-123
+          descriptor = "ABC Technologies"
+
+          ↓ authenticate + MANAGE authorization
+
+          Add Vendor Command
+          ↓ read-only identity resolution
+
+          MATCH / confirmed existing
+              → use existing ACTIVE NetworkBusiness
+
+          NO_MATCH / user chooses Create New
+              → create NB-new(PENDING_SOURCE)
+              → idempotently create/associate QBO Vendor/Customer
+              → attach SourceRecordKey
+              → NB-new = ACTIVE
+              → create ACTIVE relationship_assertion
+              → commit
+
+          If QBO creation times out:
+              → return 202 SOURCE_ASSOCIATION_PENDING
+              → same operation is retried/reconciled; no duplicate identity
+
+10:00:01  Browser
+          GET /businesses/{myBusinessId}/network?depth=2
+
+          ↓ authenticate
+          ↓ resolve canonical ID
+          ↓ validate depth/work budget
+          ↓ recursive PostgreSQL traversal
+          ↓ authorization at every expansion
+          ↓ rank/cap/page
+
+          → newly committed relationship is visible from the same
+            authoritative PostgreSQL store, subject to authorization.
 ```
 
-without requiring distributed transactions.
+### 10.3 Failure boundaries
+
+- **Resolution unavailable:** fail closed with
+  `503 ENTITY_RESOLUTION_UNAVAILABLE`; do not create speculative
+  identities/edges.
+- **QBO source creation fails:** keep `PENDING_SOURCE` while background
+  reconciliation retries; after the configurable retry/abandonment
+  policy is exhausted, mark `SOURCE_CREATION_FAILED` (audit retained, no
+  edge created). Idempotency prevents duplicate network/source records.
+- **Merge worker fails:** PostgreSQL retains authoritative state/outbox_event;
+  retry idempotently. Reads remain correct via canonicalization or are
+  temporarily limited for a consolidating identity if merge-aware
+  traversal is too complex.
+- **Redis unavailable (if introduced):** bypass cache and read
+  PostgreSQL; cache is never authoritative.
+- **Future Neo4j unavailable:** PostgreSQL remains authoritative;
+  graph-serving degradation must not corrupt writes.
+
+### 10.4 Observability and operations
+
+Track: API latency/error rate by operation and depth; explored
+nodes/edges; authorization-pruned expansions; hot-business frequency;
+cache hit/miss/eviction if Redis is enabled; resolution
+candidate/confirmation/no-match rates; false-merge/reversal rate;
+pending-source age; merge-consolidation lag/failures; outbox_event backlog; DB
+saturation/slow queries. Use correlation IDs across request, resolution,
+source creation, merge and async work. Security-sensitive
+merge/resolution decisions are retained in the audit model.
 
 ------------------------------------------------------------------------
 
-# 13. Datastore Decision & Falsifiable Pivot Criteria
+## 11. Consistency Model
 
-## Why PostgreSQL first?
+Genuinely open pending A6. Architecture is built to support either
+answer without a rewrite:
 
-The primary V1 difficulty is not raw QPS. It is:
+- **If strong/read-your-writes required:** PostgreSQL as the single
+  read/write path for relationships is sufficient on its own — no
+  projection lag to reason about.
+- **If eventual consistency acceptable:** the same PostgreSQL schema
+  remains the source of truth; a future Neo4j serving layer (Section 9)
+  can be populated via outbox_event + event projection without changing the
+  write path.
 
-- identity correctness;
-- transactional source mapping;
-- relationship provenance;
-- authorization;
-- idempotency;
-- merge races;
-- auditability;
-- bounded traversal.
-
-These fit naturally into a relational authoritative model.
-
-| Criterion                     | PostgreSQL V1         | Graph serving store             |
-|-------------------------------|-----------------------|---------------------------------|
-| Identity/mapping transactions | Strong fit            | Not primary reason to adopt     |
-| Constraints/idempotency       | Strong fit            | Additional coordination needed  |
-| Audit/merge workflow          | Strong fit            | PG still useful                 |
-| Direct adjacency              | Straightforward       | Strong fit                      |
-| Bounded 2–3 hop traversal     | Must benchmark        | Natural graph semantics         |
-| Deep/variable traversal       | Increasing complexity | Stronger fit                    |
-| Operational footprint         | Lower                 | Higher                          |
-| Additional consistency model  | None                  | Projection lag/rebuild required |
-
-The decision is intentionally **falsifiable**.
-
-## Benchmark matrix
-
-Test at least:
-
-``` text
-Topology
-- normal business
-- hub business
-- adversarial near-max branching
-- hot-node concurrency
-
-Query
-- 1-hop network
-- 2-hop network
-- 3-hop network
-- shortest path
-- authorization-heavy traversal
-```
-
-Measure:
-
-``` text
-P50 / P95 / P99 latency
-nodes explored
-edges explored
-authorization evaluations
-rows scanned
-DB CPU / IO
-connection-pool pressure
-query-plan stability
-timeout/truncation rate
-implementation complexity
-```
-
-Representative provisional latency objectives:
-
-| Query                       | Initial target |
-|-----------------------------|---------------:|
-| Direct neighborhood         |    `<= 100 ms` |
-| 2-hop bounded expansion     |    `<= 250 ms` |
-| 3-hop bounded expansion     |    `<= 500 ms` |
-| Bounded shortest-hop search |    `<= 750 ms` |
-
-These are benchmark targets, not claims about measured production
-performance.
-
-## Pivot rule
-
-``` text
-Benchmark representative + adversarial workloads
-                 |
-                 v
-        PostgreSQL meets envelope?
-             /          \
-           yes           no
-            |             |
-      Stay simple     Optimize query/index/
-                      batching/work budgets
-                            |
-                            v
-                     Still misses envelope?
-                         /        \
-                       no          yes
-                        |           |
-                    Stay PG     Introduce graph
-                                serving projection
-```
-
-Redis is evaluated independently. A hot-neighborhood cache may be
-justified even when PostgreSQL remains the graph-serving datastore.
+What the design explicitly avoids: a synchronous dual-write to two
+databases pretending to be one transaction.
 
 ------------------------------------------------------------------------
 
-# 14. Evolution Architecture
+## 12. Entity Resolution & AI
 
-The evolution path preserves one authoritative source while adding
-specialized serving components only when measurements justify them.
+    User: Add Vendor "ABC Consulting"
+            │
+            ▼
+    Normalize input
+            │
+            ▼
+    Candidate retrieval (deterministic matching first)
+            │
+            ▼
+    Scoring (deterministic + ML/semantic signals as enhancement)
+            │
+       ┌────┴─────────────────┐
+       │                       │
+    No credible candidate   Possible match(es)
+       │                       │
+       ▼                       ▼
+    Return NO_MATCH         Return CONFIRM_REQUIRED + candidates
+    (no side effect)        (no side effect; synchronous — no latency
+                            SLO promised until benchmarked, A10)
+                                    │
+                                    ▼
+                            UI confirmation required (A9 — always,
+                            never auto-merge in V1)
+                              [Use Existing]  [Create New]
 
-``` mermaid
-flowchart TB
-    UI["QuickBooks UI / Clients"]
-    GW["API Gateway"]
+**Correctness framing (not a slogan):**
 
-    subgraph SVC["Business Network"]
-        QS["Network Query Service"]
-        CS["Command Service"]
-        IRS["Identity Resolution Service"]
-    end
+> “Verified deterministic identifiers, **if the source system provides
+> them**, establish identity directly. AI/ML assists in finding and
+> ranking *ambiguous* candidates; it does not unilaterally establish
+> financial-graph truth in V1. Every merge requires human confirmation,
+> is non-destructive, and is auditable.”
 
-    PG[("PostgreSQL<br/>AUTHORITATIVE SOURCE OF TRUTH")]
-    OUT["Transactional outbox_event"]
-    PUB["Projection Publisher"]
+**Failure mode:** if the resolution service is unavailable, the system
+**fails closed** — no speculative business creation — returning
+`503 ENTITY_RESOLUTION_UNAVAILABLE`, with deterministic matching (not
+dependent on the ML/LLM path) continuing to function where possible.
 
-    REDIS[("Optional Redis<br/>hot-neighborhood cache")]
-    GRAPH[("Future Graph Serving Projection<br/>e.g. Neo4j")]
-
-    subgraph AI["Identity Intelligence"]
-        RET["Candidate Retrieval"]
-        RANK["ML / Semantic Ranker"]
-        GATE["Decision Gate"]
-        HUMAN["Human Confirmation"]
-    end
-
-    QBO["QBO Domain<br/>raw transaction authority"]
-    EV["CDC / Event Stream"]
-    EP["Transaction Evidence Processor"]
-    HB["Historical Bootstrap"]
-    REC["Reconciliation / Quality Jobs"]
-
-    UI --> GW
-    GW --> QS
-    GW --> CS
-
-    QS --> PG
-    QS -. optional cache .-> REDIS
-    QS -. benchmark-gated reads .-> GRAPH
-
-    CS --> PG
-    CS --> QBO
-    QBO --> EV --> EP --> PG
-    QBO --> HB --> PG
-
-    IRS --> RET --> RANK --> GATE
-    GATE --> HUMAN
-    GATE --> PG
-    HUMAN --> PG
-
-    PG --> OUT --> PUB
-    PUB -. rebuildable projection .-> GRAPH
-    PUB -. invalidation / warming .-> REDIS
-
-    PG --> REC
-    QBO --> REC
-    REC --> PG
-```
-
-## Evolution sequence
-
-### Stage 1 — PostgreSQL-first V1
-
-Use one authoritative store and prove correctness, privacy, and bounded
-traversal.
-
-### Stage 2 — Cache measured hot paths
-
-If profiling shows repeated hot-neighborhood reads, introduce Redis
-with:
-
-- short TTL;
-- version-aware/invalidation strategy;
-- authoritative fallback;
-- no correctness dependence.
-
-### Stage 3 — Graph serving projection
-
-Introduce graph-native serving only if representative/adversarial
-benchmarks show that relational traversal cannot meet the required
-envelope safely or maintainably.
-
-The graph store receives changes asynchronously from the authoritative
-outbox_event.
-
-Consequences are explicit:
-
-- projection lag must be measured;
-- stale-read semantics must be defined;
-- rebuild tooling is required;
-- PostgreSQL remains authoritative;
-- no synchronous PostgreSQL + graph dual-write.
-
-### Stage 4 — Improve identity automation
-
-Increase automation only after measured resolution quality supports it.
-
-AI remains behind a decision gate and does not independently write
-authoritative financial-network truth.
+**Resolution drift** (a business’s descriptors drift into two separate
+NetworkBusinesses over time via independently-resolved records) is a
+known, explicitly logged V1 gap — addressed later via periodic Identity
+Reconciliation reusing the same confirm/merge infrastructure, not a new
+mechanism.
 
 ------------------------------------------------------------------------
 
-# 15. API Surface
+## 13. API Contracts
 
-Representative API surface:
+| Endpoint                               | Purpose        | Key behavior                                                                                                                     |
+|:---------------------------------------|:---------------|:---------------------------------------------------------------------------------------------------------------------------------|
+| `GET /businesses/{id}/network?depth=N` | FR1            | Server-capped depth (reject out-of-range); authorization-filtered; ranked/paginated                                              |
+| `GET /relationships/path?from=A&to=B`  | FR2            | Shortest by hop count; `NOT_FOUND_WITHIN_DEPTH` distinct from “not connected”                                                    |
+| `POST /businesses/resolve`             | FR4            | **Read-only** resolution: returns `MATCH`, `NO_MATCH`, or `CONFIRM_REQUIRED`; never creates identity/source state                |
+| `POST /businesses/{id}/vendors`        | FR3/FR4a       | Idempotent side-effecting Add Vendor command; owns `PENDING_SOURCE` → QBO source association → ACTIVE → relationship sequence    |
+| `POST /businesses/{id}/vendors/confirm` | FR4/FR4a      | Resumes an `AWAITING_CONFIRMATION` Add Vendor operation after the user chooses **Use Existing** or **Create New**                 |
+| `POST /relationships`                  | FR3            | Lower-level relationship command; requires ACTIVE resolved `NetworkBusinessId`s and records `relationship_assertion.source_type` |
+| `POST /business-identity/merges`       | Merge workflow | Confirms merge; triggers async consolidation                                                                                     |
 
-``` http
-GET /businesses/{id}/network?depth=N
-```
+### 13.1 API semantics and important errors
 
-Returns a bounded authorized network view with pagination/truncation
-metadata.
+**`GET /businesses/{id}/network?depth=N&cursor=...`** - `200`: bounded,
+ranked/paginated nodes + edges + `nextCursor` + `truncated`/budget
+metadata. - `400 INVALID_DEPTH`: outside server-supported range. -
+`404 NOT_FOUND`: also used where distinguishing unauthorized existence
+would leak information. - `429`: tenant/request budget exceeded. -
+`503`: datastore temporarily unavailable.
 
-``` http
-GET /relationships/path?from=A&to=B&maxDepth=N
-```
+**`GET /relationships/path?from=A&to=B&maxDepth=N`** - `200`: shortest
+path by hop count. - `404 NOT_FOUND_WITHIN_DEPTH`: no authorized path
+was found within the configured search budget. It deliberately does not
+reveal whether a path exists through businesses the requester is not
+authorized to see, and it does not assert global disconnection (A19).
 
-Returns an authorized shortest-hop path within the bounded search
-envelope.
+**`POST /businesses/resolve`** - **Read-only.** Input: source type +
+descriptor fields available from the caller; no Tax ID/platform
+identifier is assumed unless actually supplied by the source system. -
+`200 MATCH | NO_MATCH | CONFIRM_REQUIRED` with bounded top-K
+candidates/evidence. V1 is synchronous (A10); if candidate generation later cannot meet the interactive latency budget, the computation may move behind an async job without changing these resolution semantics. - `NO_MATCH` does **not** create a
+`NetworkBusiness`; creation is owned by the Add Vendor command below. -
+`503 ENTITY_RESOLUTION_UNAVAILABLE` when the required resolution path
+cannot safely complete.
 
-``` http
-POST /businesses/resolve
-```
+**`POST /businesses/{ownerBusinessId}/vendors`** - Side-effecting Add
+Vendor orchestration endpoint; requires caller `MANAGE` authorization
+and an `Idempotency-Key`. - Internally invokes the read-only resolver.
+`MATCH`/confirmed existing proceeds with an ACTIVE identity;
+`NO_MATCH`/explicit **Create New** executes FR4a. - `201` when the
+source association and relationship assertion are committed. -
+`202 SOURCE_ASSOCIATION_PENDING` when a `PENDING_SOURCE` identity exists
+but source creation/association is still retrying; returns the stable
+operation ID and `NetworkBusinessId`. - `409 IDENTITY_NOT_ACTIVE` when a
+caller attempts to bypass the orchestration and create a relationship to
+`PENDING_SOURCE`/`SOURCE_CREATION_FAILED`. - Repeating the same
+idempotency key returns/resumes the same operation.
 
-Resolves a descriptor to `MATCH`, `NO_MATCH`, or `CONFIRM_REQUIRED`.
+**`POST /businesses/{ownerBusinessId}/vendors/confirm`** - Resumes the existing `business_add_operation` in `AWAITING_CONFIRMATION`; requires the stable operation ID plus an explicit `USE_EXISTING` (with selected `NetworkBusinessId`) or `CREATE_NEW` decision. It does not start a second Add Vendor operation and reuses the original operation/idempotency state. - `201` when the relationship completes synchronously; `202 SOURCE_ASSOCIATION_PENDING` when a new identity is waiting for QBO source association; `409 INVALID_OPERATION_STATE` if the operation is no longer awaiting confirmation.
 
-``` http
-POST /businesses/{owner}/vendors
-Idempotency-Key: <key>
-```
+**`POST /relationships`** - Requires two ACTIVE resolved
+`NetworkBusinessId`s, idempotency key, source type/reference, and caller
+authorization. - `201` on new assertion; repeated same idempotency key
+returns the prior result. - `409 IDENTITY_NOT_ACTIVE` for
+`PENDING_SOURCE`/invalid merge state. - Exact transaction-derived
+mutation semantics remain provisional until A12 is answered.
 
-Starts/resumes Add Vendor.
-
-``` http
-POST /businesses/{owner}/vendors/confirm
-```
-
-Confirms an ambiguous identity candidate.
-
-``` http
-POST /relationships
-Idempotency-Key: <key>
-```
-
-Creates relationship provenance rather than directly mutating a derived
-serving edge.
-
-``` http
-POST /business-identity/merges
-```
-
-Starts a controlled canonical-identity merge.
-
-``` http
-POST /business-identity/merges/{id}/reverse
-```
-
-Requests reversal when stored snapshots and current state make reversal
-safe.
-
-## Response semantics
-
-Useful response metadata includes:
-
-``` json
-{
-  "maxDepth": 3,
-  "truncated": true,
-  "nextPageToken": "...",
-  "workLimitReached": true
-}
-```
-
-A bounded path miss should be distinguishable from a globally proven
-absence of relationship.
+**`POST /business-identity/merges`** - Requires explicit confirmed
+source/target IDs and idempotency key. - `202` after the
+merge-confirmation transaction commits and asynchronous consolidation is
+queued. - Status is observable by merge operation ID. Incorrect merges are
+handled through a controlled administrative reconciliation workflow;
+generic automatic reversal is outside V1.
 
 ------------------------------------------------------------------------
 
-# 16. Security, Privacy & Authorization
+## 14. Security & Privacy
 
-Authorization is not merely an API-edge concern.
-
-Consider:
-
-``` text
-A ---- B ---- C
-```
-
-If the caller can see `A` and `C` but cannot know that `B` exists,
-returning the literal path leaks protected information.
-
-The traversal policy therefore supports outcomes such as:
-
-| Decision        | Meaning                                                                      |
-|-----------------|------------------------------------------------------------------------------|
-| `REVEAL`        | Node may be traversed and returned                                           |
-| `TRAVERSE_ONLY` | Policy permits traversal but response must not reveal the protected identity |
-| `DENY`          | Do not traverse or reveal                                                    |
-
-The exact Product/privacy semantics of `TRAVERSE_ONLY` must be defined
-carefully so path shape, counts, pagination, timing, and error responses
-do not indirectly reveal hidden businesses.
-
-Additional controls:
-
-- authenticate at the gateway;
-- authorize every requested root;
-- evaluate access during expansion;
-- canonicalize IDs before policy/data access;
-- audit sensitive identity mutations;
-- encrypt data in transit and at rest;
-- apply least-privilege DB/service credentials;
-- rate-limit expensive traversal separately from simple reads.
+- Authorization is evaluated **during** traversal expansion, not as a
+  post-hoc filter on a fully resolved response.
+- V1 edge-visibility policy (A17, provisional): an edge is traversable
+  only if the principal can see **both** endpoints — chosen to fail
+  toward under-disclosure.
+- `network_business_access` models `principal_id` deliberately as *not*
+  necessarily an individual user — likely a QBO company/tenant — with
+  the exact principal model left open pending product input.
+- Relationship weight and transaction data are sensitive financial
+  information; no field in this model is exposed outside authorization
+  checks, including in error responses (avoiding existence-leakage via
+  distinguishable “not found” vs. “unauthorized” responses).
 
 ------------------------------------------------------------------------
 
-# 17. Observability & Operations
+## 15. Trade-offs & Alternatives Considered
 
-## Query metrics
-
-Track by depth/topology class:
-
-``` text
-latency P50/P95/P99
-nodes explored
-edges explored
-results returned
-truncation rate
-timeout rate
-authorization evaluation count/cost
-DB rows scanned
-DB CPU/IO
-cache hit rate
-```
-
-## Write/recovery metrics
-
-``` text
-idempotent replay rate
-outbox_event backlog / oldest age
-PENDING_SOURCE count and age
-source-association retry count
-merge backlog
-merge consolidation lag
-stale-fence retry rate
-reconciliation mismatches
-```
-
-## Transaction evidence metrics
-
-``` text
-event ingest rate
-consumer lag / oldest event age
-events processed/sec
-duplicate/replay count
-failed or quarantined events
-pre-aggregation reduction ratio
-PostgreSQL aggregate UPSERT rate
-evidence processing latency
-bootstrap progress
-bootstrap/live watermark
-canonical-resolution failures
-```
-
-## Identity metrics
-
-``` text
-MATCH / NO_MATCH / CONFIRM_REQUIRED distribution
-candidate Recall@K
-suggested-match precision
-confirmation rate
-false-merge rate
-merge reversal rate
-quality by descriptor completeness
-model/resolver version
-```
-
-## Degradation order
-
-When dependencies or capacity are constrained:
-
-1.  protect correctness and privacy;
-2.  protect authoritative writes;
-3.  reduce traversal work/result budgets if necessary;
-4.  bypass optional cache;
-5.  fall back from optional graph projection;
-6.  disable/limit nonessential enrichment;
-7.  never trade ambiguous identity correctness for availability.
+| Decision                                                  | Alternative considered                   | Why rejected (for V1)                                                                                                                                                                                               |
+|:----------------------------------------------------------|:-----------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| PostgreSQL-only                                           | Neo4j-only                               | Identity/merge/audit workloads are relational; Neo4j would handle them adequately, not excellently, and ~4 average QPS, and even the illustrative 50× stress case (~193 QPS), do not demand graph-native throughput |
+| PostgreSQL-only                                           | Hybrid (PostgreSQL + Neo4j projection)   | Real value (“graph query semantics”) doesn’t yet outweigh the operational cost (replication lag, projector failure/rebuild, two datastores) at this scale — revisit if path/multi-hop usage proves high-frequency   |
+| Shortest path by hop count                                | Shortest path by transaction-amount cost | Undefined semantics — no basis to say a ₹10M edge is “closer” or “further” than a ₹1K edge                                                                                                                          |
+| Fail-closed on resolution outage                          | Fail-open (create speculative business)  | Silent duplicate-identity accumulation is worse than a temporary block on Add Vendor                                                                                                                                |
+| Always-confirm ambiguous matches (V1)                     | High-confidence auto-merge               | False merges are hard to reverse cleanly and corrupt financial relationship data; auto-resolution can be introduced later if evaluation demonstrates low false-merge risk                                           |
+| Undirected serving edge derived from directional evidence | Store only undirected weight             | Loses the directional provenance needed to evolve toward directional modeling later                                                                                                                                 |
 
 ------------------------------------------------------------------------
 
-# 18. Key Trade-offs
+## 16. Evolution Path
 
-| Decision                             | Benefit                                           | Cost / limitation                                   |
-|--------------------------------------|---------------------------------------------------|-----------------------------------------------------|
-| PostgreSQL-first                     | Transactions, constraints, simpler operations     | Multi-hop traversal must be benchmarked             |
-| Canonical `NetworkBusinessId`        | Stable cross-role topology                        | Requires identity-resolution layer                  |
-| Human confirmation for ambiguity     | Reduces false merges                              | Adds user friction                                  |
-| Bounded traversal                    | Predictable resource usage                        | Does not expose an unlimited graph                  |
-| Separate compute/result budgets      | Protects system independently of UX response size | More query-policy machinery                         |
-| Active assertions define topology    | Clear provenance and lifecycle                    | More modeling than deriving edges from transactions |
-| Directional evidence kept separately | Preserves business reality                        | Serving projection requires aggregation             |
-| Aggregate evidence instead of copying raw transactions | Serving/storage scale follows business relationships, not transaction count | Requires reliable incremental feed, replay-safe aggregation, bootstrap and reconciliation |
-| No invented weight formula           | Avoids encoding unsupported Product semantics     | Weighted ranking deferred                           |
-| Transactional outbox_event                 | Reliable asynchronous evolution                   | Requires publisher/idempotent consumers             |
-| Async graph projection               | Avoids synchronous dual-write                     | Introduces eventual consistency                     |
-| AI as ranking assistant              | Improves resolution while retaining control       | Requires evaluation/audit/confirmation              |
-| Merge snapshots + fencing            | Safe recovery/concurrency                         | Additional storage and workflow complexity          |
+- **Graph serving layer:** if multi-hop/path queries prove high-frequency or latency-sensitive, project the **authoritative relationship state** — ACTIVE `relationship_assertion` edge existence plus `relationship_direction` transaction evidence — into a derived Neo4j serving graph via outbox_event + event projection. PostgreSQL remains authoritative. This avoids treating transaction evidence alone as proof that an edge currently exists.
+- **Selective auto-resolution:** once evaluation data shows acceptably
+  low false-merge risk for specific high-confidence signal combinations,
+  carefully scoped auto-merge could be introduced — not assumed in V1.
+- **Identity reconciliation:** periodic background job to catch
+  resolution drift, reusing existing merge/confirm infrastructure.
+- **Directional relationship modeling:** the underlying evidence is
+  already preserved; a directional network view is a query-shape change,
+  not a storage migration.
+- **Community/graph analytics:** not built in V1, but the graph model
+  doesn’t preclude it — a deliberate product decision to defer, not an
+  architectural limitation.
 
 ------------------------------------------------------------------------
 
-## Design Invariants
+## 17. Executable Vertical Slice vs. Production Architecture
 
-The design can be summarized by the invariants that must remain true as
-the implementation evolves:
+This design describes the target production architecture. The
+accompanying demo intentionally collapses distributed components into a
+Spring Boot application while preserving domain boundaries, the API
+surface, the identity/relationship data model, and the entity-resolution
+workflow. PostgreSQL is the authoritative V1 datastore. Redis may be
+included behind a cache interface for the hot-node experiment, but it is
+not treated as required production architecture unless the benchmark
+justifies it. Where the demo diverges from this document, it is called
+out explicitly rather than left implicit.
 
-1.  **Every relationship endpoint resolves to a current canonical
-    business identity.**
-2.  **Ambiguous identity is never silently converted into an
-    authoritative merge.**
-3.  **Relationship existence is controlled by active provenance
-    assertions, not historical transaction totals.**
-4.  **Authorization participates in traversal; hidden identities are not
-    merely filtered after computation.**
-5.  **Depth limits and work limits are separate controls.**
-6.  **Retries do not duplicate externally visible mutations.**
-7.  **Merge races are protected by locked canonical decisions and
-    version/fence validation.**
-8.  **PostgreSQL is authoritative in V1; caches and future graph stores
-    are rebuildable projections.**
-9.  **AI ranks and assists; it does not bypass authoritative decision
-    gates.**
-10. **A new datastore is introduced because measured workloads require
-    it, not because the domain happens to contain a graph.**
-11. **QBO remains authoritative for transaction-level financial data;
-    Business Network stores only the derived directional evidence required
-    for network serving.**
-12. **Transaction evidence processing is replay-safe: retries, redelivery,
-    and bootstrap/live overlap must not double-count directional aggregates.**
+------------------------------------------------------------------------
+
+## Appendix: Open Items Requiring Explicit Panel Acknowledgment
+
+- **A2/A16 (business ownership / identity unification) remain the
+  highest structural pivot.** This is stronger than saying every open
+  assumption is isolated behind stable interfaces and would only change
+  configuration/schema. If Intuit confirms that QuickBooks already owns a
+  canonical cross-role Business ID, the identity subsystem may simplify
+  materially: Business Network ownership of `NetworkBusiness`, typed
+  `SourceBusinessRef` unification, entity-resolution creation semantics,
+  merge semantics/snapshots, and identity reconciliation may substantially
+  simplify or disappear. The graph, relationship, traversal,
+  authorization, and external API boundaries remain stable because they
+  operate on `NetworkBusinessId`; the identity subsystem specifically does
+  **not** merely reconfigure. **A6 (freshness)** is separately open but is
+  a Medium V1 pivot with a single authoritative PostgreSQL read/write path,
+  becoming a High architectural pivot only if a separate serving projection
+  such as Neo4j is introduced.
+- **A12 (relationship source)** and its downstream `source_reference`
+  semantics block finalizing the relationship-mutation API until
+  resolved or a provisional demo behavior is explicitly chosen.
+- **Merge reversal fidelity** (invariant 27), **concurrent-merge
+  locking** (invariants 7, 19, 24), and **read-time behavior during the
+  consolidation window** (invariant 18) are documented, mechanized V1
+  limitations — not hidden gaps and not unconditional promises.
+- **A19**: path search cannot distinguish “no path exists” from “a path
+  exists through a business you’re not authorized to see” — a
+  deliberate, privacy-motivated exception to the otherwise-strict
+  `NOT_FOUND_WITHIN_DEPTH` vs. `NOT_CONNECTED` distinction (Section 4,
+  FR2).
+- **`PENDING_SOURCE` sequencing and orphan lifecycle** now have a
+  provisional V1 policy (FR4a): the read-only resolver returns
+  `NO_MATCH`; the Add Vendor/Client command then creates the pending
+  network identity → idempotently creates/associates the QBO source
+  record → attaches the typed source ref → activates → allows
+  relationship creation. Server-owned retry handles temporary failures;
+  exhausted/abandoned operations become `SOURCE_CREATION_FAILED` rather
+  than remaining pending indefinitely. Intuit clarification may
+  simplify/change this sequence.
