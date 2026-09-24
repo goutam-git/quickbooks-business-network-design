@@ -1,6 +1,5 @@
 # QuickBooks Business Network — Interview-Focused System Design
 
-**Craft System Design — Senior Staff Builder**  
 **Scope:** V1 design and executable reference implementation.
 
 > This version intentionally keeps only the decisions, flows, assumptions, and trade-offs that are useful to explain in an interview. Detailed speculative mechanisms and low-value open questions have been removed.
